@@ -1,9 +1,19 @@
+/**
+ * Gemini Live API 服务
+ *
+ * 使用 Gemini 2.5 Flash Native Audio 模型进行实时图片分析
+ *
+ * 注意事项：
+ * 1. 需要 VPN 连接到美国（API 不支持中国地区）
+ * 2. 图片必须是有效的 JPEG/PNG 格式
+ * 3. 视频+音频会话限制为 2 分钟
+ */
 
-import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution } from "@google/genai";
+import { GoogleGenAI, Modality, MediaResolution } from "@google/genai";
 import { ConnectionState, SessionStatus } from "../types";
 
-/** Session monitoring duration (disabled auto-reconnect by default) */
-const SESSION_DURATION_SEC = 300;
+/** Session duration before auto-reconnect (seconds) */
+const SESSION_DURATION_SEC = 120; // 2 minutes for video sessions
 
 const WEPOKER_SYSTEM_PROMPT = `
 ROLE: WePoker 实时GTO分析专家 (中文界面识别 + 英文标准输出)
@@ -74,8 +84,11 @@ export class GeminiLiveService {
 
     try {
       const config: any = {
-        responseModalities: [Modality.TEXT],
-        systemInstruction: WEPOKER_SYSTEM_PROMPT,
+        responseModalities: [Modality.AUDIO],
+        mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
+        systemInstruction: {
+          parts: [{ text: WEPOKER_SYSTEM_PROMPT }],
+        },
       };
 
       // Only add session resumption if we have a handle
@@ -86,7 +99,7 @@ export class GeminiLiveService {
       }
 
       const session = await this.client.live.connect({
-        model: 'gemini-2.0-flash-live-001',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config,
         callbacks: {
           onopen: () => {
@@ -97,8 +110,16 @@ export class GeminiLiveService {
           onclose: (e: any) => {
             console.log('Connection closed:', e);
             console.log('Close code:', e.code, 'reason:', e.reason);
-            this.session = null;  // Clear session immediately to stop frame sending
+            this.session = null;
             this.stopSessionTimer();
+
+            // Check for location error
+            if (e.reason?.includes('location is not supported')) {
+              this.config.onError('API 不支持当前地区，请使用 VPN 连接到美国');
+              this.config.onStateChange(ConnectionState.ERROR);
+              return;
+            }
+
             // Only reconnect if still active and not manually stopped
             if (this.active && this.reconnectCount < 3) {
               console.log('Attempting reconnect...');
@@ -110,7 +131,7 @@ export class GeminiLiveService {
           },
           onerror: (err: any) => {
             console.error('Live API error:', err);
-            this.session = null;  // Clear session immediately
+            this.session = null;
             this.stopSessionTimer();
             this.config.onError(err.message || 'Live API 错误');
             this.config.onStateChange(ConnectionState.ERROR);
@@ -122,7 +143,6 @@ export class GeminiLiveService {
     } catch (error: any) {
       this.stopSessionTimer();
       if (this.active && this.reconnectCount < 5) {
-        // Retry on connection failure
         this.autoReconnect();
       } else {
         this.config.onStateChange(ConnectionState.ERROR);
@@ -131,22 +151,37 @@ export class GeminiLiveService {
     }
   }
 
-  private handleMessage(message: LiveServerMessage) {
+  private handleMessage(message: any) {
     if (!this.active) return;
+
+    // Debug logging
+    console.log('[Gemini] Message received:', JSON.stringify(message, null, 2));
 
     // Store resumption handle for seamless reconnect
     if (message.sessionResumptionUpdate?.newHandle) {
       this.resumptionHandle = message.sessionResumptionUpdate.newHandle;
+      console.log('[Gemini] Session resumption handle updated');
     }
 
     // Handle server goAway — reconnect proactively
     if (message.goAway) {
+      console.log('[Gemini] GoAway received, reconnecting...');
       this.autoReconnect();
       return;
     }
 
-    const text = message.serverContent?.modelTurn?.parts?.[0]?.text;
+    // Extract text response
+    const modelTurnText =
+      message.serverContent?.modelTurn?.parts
+        ?.map((p: any) => p.text)
+        .filter((t: any): t is string => Boolean(t))
+        .join('') || '';
+
+    const outputTranscriptionText = message.serverContent?.outputTranscription?.text || '';
+
+    const text = modelTurnText || outputTranscriptionText;
     if (text) {
+      console.log('[Gemini] AI Response:', text);
       this.config.onTranscription(text);
     }
   }
@@ -206,11 +241,14 @@ export class GeminiLiveService {
     if (!this.session || !this.active) return;
     try {
       const cleanBase64 = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
+
+      // 使用 media 字段发送图片（支持 JPEG 和 PNG）
+      // 注意：图片必须是有效的格式，否则会报错
       this.session.sendRealtimeInput({
         media: { mimeType: 'image/jpeg', data: cleanBase64 },
       });
-    } catch {
-      // Frame send failure is non-fatal; next frame will retry
+    } catch (err) {
+      console.error('Frame send error:', err);
     }
   }
 

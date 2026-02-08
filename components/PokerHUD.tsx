@@ -48,8 +48,13 @@ const PokerHUD: React.FC = () => {
   }, []);
 
   const handleTranscription = useCallback((text: string) => {
+    console.log('[PokerHUD] Raw transcription:', text);
+
     const cleanText = text.replace(/[^a-zA-Z0-9\s\-\u4e00-\u9fff]/g, '').toUpperCase().trim();
-    if (!cleanText) return;
+    if (!cleanText) {
+      console.log('[PokerHUD] Empty text after cleaning');
+      return;
+    }
 
     let type: 'NEUTRAL' | 'ACTION' | 'FOLD' | 'GOOD' | 'WARNING' = 'NEUTRAL';
     let display = "";
@@ -77,9 +82,13 @@ const PokerHUD: React.FC = () => {
       type = 'WARNING';
       display = "无信号";
     } else {
-      return;
+      // Show unrecognized responses as warnings for debugging
+      console.log('[PokerHUD] Unrecognized response:', cleanText);
+      type = 'WARNING';
+      display = cleanText.length > 20 ? cleanText.substring(0, 20) + '...' : cleanText;
     }
 
+    console.log('[PokerHUD] Setting advice:', display, 'type:', type);
     setLastAdvice(display);
     setAdviceType(type);
   }, []);
@@ -148,7 +157,10 @@ const PokerHUD: React.FC = () => {
 
       if (!serviceRef.current) {
         serviceRef.current = new GeminiLiveService({
-          onStateChange: setConnectionState,
+          onStateChange: (state) => {
+            setConnectionState(state);
+            if (state === ConnectionState.CONNECTED) startFrameLoop();
+          },
           onTranscription: handleTranscription,
           onError: (msg) => {
             setErrorMsg(msg);
@@ -159,7 +171,6 @@ const PokerHUD: React.FC = () => {
       }
 
       await serviceRef.current.connect();
-      startFrameLoop();
     } catch (err: any) {
       console.error(err);
       let friendlyMsg = "启动捕获失败";
@@ -332,7 +343,7 @@ const PokerHUD: React.FC = () => {
       <div className="p-6 bg-zinc-900/50 border-t border-zinc-800/50 flex justify-between items-center text-[10px] font-mono text-zinc-600 uppercase tracking-widest">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-          <span>引擎: Gemini 2.0 Flash Lite</span>
+          <span>引擎: Gemini 2.0 Flash Live</span>
         </div>
         <div className="flex items-center gap-4">
           <span>模式: {captureMode === 'TAB' ? '屏幕' : '摄像头'}</span>
