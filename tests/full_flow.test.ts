@@ -11,8 +11,8 @@ describe('Realtime Integration Test (Full Flow)', () => {
   const PROXY_URL = 'ws://localhost:3301/realtime';
 
   it('should handle full poker analysis flow', async () => {
-    // 增加超时时间，因为涉及多次往返
-    const timeout = 15000;
+    // 增加超时时间，Realtime 冷启动可能 >20s
+    const timeout = 40000;
 
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(PROXY_URL);
@@ -20,7 +20,7 @@ describe('Realtime Integration Test (Full Flow)', () => {
 
       const timer = setTimeout(() => {
         ws.close();
-        reject(new Error('Test timeout'));
+        reject(new Error('Test timeout - AI response took too long'));
       }, timeout);
 
       ws.on('open', () => {
@@ -30,7 +30,7 @@ describe('Realtime Integration Test (Full Flow)', () => {
           type: 'session.update',
           session: {
             modalities: ['text'],
-            instructions: 'You are a poker assistant. Output "FOLD" if you see nothing.'
+            instructions: 'You are a poker assistant. Just reply "TEST_OK".'
           }
         }));
       });
@@ -42,13 +42,14 @@ describe('Realtime Integration Test (Full Flow)', () => {
         // 2. 等待 Session Ready
         if (msg.type === 'session.created') {
             sessionCreated = true;
-            console.log('Session created. Sending image...');
+            console.log('Session created. Sending dummy inputs...');
             
             // 3. 模拟 PokerHUD 发送流程
-            // 先发音频 append (Realtime 要求)
+            // 先发一段稍长的静音包 (Realtime 有时会丢弃过短的音频)
+            const silence = Buffer.alloc(3200).toString('base64'); // 100ms 16k mono
             ws.send(JSON.stringify({
                 type: 'input_audio_buffer.append',
-                audio: 'AAA=' // 最小静音包
+                audio: silence
             }));
 
             // 发图片
@@ -92,5 +93,5 @@ describe('Realtime Integration Test (Full Flow)', () => {
         reject(err);
       });
     });
-  }, 20000);
+  }, 50000);
 });

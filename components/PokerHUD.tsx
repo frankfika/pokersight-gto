@@ -9,6 +9,10 @@ const MAX_IMAGE_DIMENSION = 768;
 
 type CaptureMode = 'TAB' | 'CAMERA';
 
+const isMacOS = (): boolean =>
+  typeof navigator !== 'undefined' &&
+  /Mac|Macintosh/i.test(navigator.userAgent);
+
 /** Map English actions to bilingual display */
 const ACTION_LABELS: Record<string, string> = {
   FOLD: '弃牌 FOLD',
@@ -146,7 +150,11 @@ const PokerHUD: React.FC = () => {
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        try {
+          await videoRef.current.play();
+        } catch (e) {
+          console.warn('Video play interrupted:', e);
+        }
       }
 
       stream.getVideoTracks()[0].onended = () => {
@@ -174,9 +182,13 @@ const PokerHUD: React.FC = () => {
       console.error(err);
       let friendlyMsg = "启动捕获失败";
       if (err.name === 'NotAllowedError') {
-        friendlyMsg = captureMode === 'TAB'
-          ? "权限被拒绝。浏览器可能因安全策略阻止了屏幕捕获，请尝试摄像头模式。"
-          : "摄像头访问被拒绝";
+        if (captureMode === 'TAB') {
+          friendlyMsg = isMacOS()
+            ? "屏幕录制权限未开启。请前往：系统设置 → 隐私与安全性 → 屏幕录制，勾选您的浏览器后重启浏览器。或切换为摄像头模式。"
+            : "权限被拒绝。请确认浏览器已获得屏幕捕获权限，或尝试摄像头模式。";
+        } else {
+          friendlyMsg = "摄像头访问被拒绝，请在浏览器设置中允许摄像头权限。";
+        }
       } else if (err.message?.includes("disallowed by permissions policy")) {
         friendlyMsg = "浏览器策略阻止了屏幕捕获，请使用摄像头模式或在独立标签页中打开。";
       }
@@ -296,7 +308,7 @@ const PokerHUD: React.FC = () => {
         <canvas ref={canvasRef} className="hidden" />
 
         {errorMsg && (
-          <div className="absolute top-10 left-1/2 -translate-x-1/2 bg-red-500/90 text-white px-6 py-3 rounded-2xl text-xs font-bold text-center max-w-xs shadow-2xl z-50">
+          <div className="absolute top-10 left-1/2 -translate-x-1/2 bg-red-500/90 text-white px-6 py-3 rounded-2xl text-xs font-bold text-center max-w-sm shadow-2xl z-50">
             {errorMsg}
           </div>
         )}
