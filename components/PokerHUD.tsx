@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { GeminiLiveService } from '../services/geminiLive';
+import { QwenRealtimeService } from '../services/qwenRealtime';
 import { ConnectionState, SessionStatus } from '../types';
 
 const FRAME_RATE = 1.0;
@@ -22,7 +22,7 @@ const ACTION_LABELS: Record<string, string> = {
 const PokerHUD: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const serviceRef = useRef<GeminiLiveService | null>(null);
+  const serviceRef = useRef<QwenRealtimeService | null>(null);
   const frameIntervalRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
@@ -156,7 +156,7 @@ const PokerHUD: React.FC = () => {
       };
 
       if (!serviceRef.current) {
-        serviceRef.current = new GeminiLiveService({
+        serviceRef.current = new QwenRealtimeService({
           onStateChange: (state) => {
             setConnectionState(state);
             if (state === ConnectionState.CONNECTED) startFrameLoop();
@@ -166,7 +166,6 @@ const PokerHUD: React.FC = () => {
             setErrorMsg(msg);
             setConnectionState(ConnectionState.ERROR);
           },
-          onSessionStatus: setSessionStatus,
         });
       }
 
@@ -343,7 +342,7 @@ const PokerHUD: React.FC = () => {
       <div className="p-6 bg-zinc-900/50 border-t border-zinc-800/50 flex justify-between items-center text-[10px] font-mono text-zinc-600 uppercase tracking-widest">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-          <span>引擎: Gemini 2.0 Flash Live</span>
+          <span>引擎: Qwen‑Omni‑Realtime</span>
         </div>
         <div className="flex items-center gap-4">
           <span>模式: {captureMode === 'TAB' ? '屏幕' : '摄像头'}</span>
