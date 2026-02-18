@@ -1,7 +1,7 @@
 import http from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { WebSocketServer, WebSocket } from 'ws';
 import dotenv from 'dotenv';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -11,11 +11,14 @@ const PORT = process.env.WS_PROXY_PORT ? Number(process.env.WS_PROXY_PORT) : 330
 const MODEL = process.env.QWEN_REALTIME_MODEL || 'qwen3-omni-flash-realtime';
 const VISION_MODEL = process.env.QWEN_VISION_MODEL || 'qwen-vl-max';
 const REGION = process.env.DASHSCOPE_REGION || 'cn';
-const BASE = REGION === 'intl' ? 'wss://dashscope-intl.aliyuncs.com' : 'wss://dashscope.aliyuncs.com';
-const TARGET = `${BASE}/api-ws/v1/realtime?model=${encodeURIComponent(MODEL)}`;
-const DASHSCOPE_HTTP_BASE = REGION === 'intl'
+
+const WS_BASE = REGION === 'intl' ? 'wss://dashscope-intl.aliyuncs.com' : 'wss://dashscope.aliyuncs.com';
+const WS_TARGET = `${WS_BASE}/api-ws/v1/realtime?model=${encodeURIComponent(MODEL)}`;
+
+const HTTP_BASE = REGION === 'intl'
   ? 'https://dashscope-intl.aliyuncs.com'
   : 'https://dashscope.aliyuncs.com';
+
 const API_KEY = process.env.DASHSCOPE_API_KEY;
 
 if (!API_KEY) {
@@ -23,9 +26,8 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-// ── HTTP Server ──────────────────────────────────────────────────
+// ── HTTP Server (fallback /api/analyze endpoint) ──────────────────
 const server = http.createServer(async (req, res) => {
-  // CORS headers for all responses
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -37,7 +39,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/api/analyze') {
-    // Read body
     let body = '';
     for await (const chunk of req) body += chunk;
 
@@ -57,11 +58,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Build DashScope OpenAI-compatible request
-    const apiUrl = `${DASHSCOPE_HTTP_BASE}/compatible-mode/v1/chat/completions`;
+    const apiUrl = `${HTTP_BASE}/compatible-mode/v1/chat/completions`;
     const payload = {
       model: VISION_MODEL,
       stream: true,
+      max_tokens: 100,
       messages: [
         ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
         {
@@ -71,7 +72,7 @@ const server = http.createServer(async (req, res) => {
               type: 'image_url',
               image_url: { url: `data:image/jpeg;base64,${image}` },
             },
-            { type: 'text', text: '请分析这张扑克牌桌截图。' },
+            { type: 'text', text: '分析这张扑克桌画面，判断当前状态并给出建议。' },
           ],
         },
       ],
@@ -79,6 +80,7 @@ const server = http.createServer(async (req, res) => {
 
     console.log(`[Proxy] POST /api/analyze → ${VISION_MODEL} (image ${Math.round(image.length / 1024)}KB)`);
 
+    let fullResponseLog = '';
     try {
       const upstream = await fetch(apiUrl, {
         method: 'POST',
@@ -97,7 +99,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Pipe SSE stream to client
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -106,16 +107,32 @@ const server = http.createServer(async (req, res) => {
 
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
         res.write(chunk);
+
+        buffer += chunk;
+        const lines = buffer.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            if (data && data !== '[DONE]') {
+              try {
+                const parsed = JSON.parse(data);
+                const content = parsed.choices?.[0]?.delta?.content;
+                if (content) fullResponseLog += content;
+              } catch {}
+            }
+          }
+        }
       }
 
       res.end();
-      console.log('[Proxy] SSE stream completed');
+      console.log('[Proxy] Response:', fullResponseLog || '(empty)');
     } catch (err) {
       console.error('[Proxy] Fetch error:', err?.message || err);
       if (!res.headersSent) {
@@ -128,17 +145,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Default: 404 for unknown routes
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ── WebSocket (backward compat) ──────────────────────────────────
+// ── WebSocket Proxy (/realtime) ──────────────────────────────────
 const wss = new WebSocketServer({ server, path: '/realtime' });
 
 wss.on('connection', (client) => {
-  console.log('[Proxy] Client connected, connecting upstream to', TARGET);
-  const upstream = new WebSocket(TARGET, {
+  console.log('[Proxy] Client connected, connecting upstream to', WS_TARGET);
+  const upstream = new WebSocket(WS_TARGET, {
     headers: { Authorization: `Bearer ${API_KEY}` },
   });
 
@@ -225,6 +241,6 @@ wss.on('connection', (client) => {
 
 server.listen(PORT, () => {
   console.log(`Qwen proxy listening on http://localhost:${PORT}`);
+  console.log(`  WS  /realtime      → DashScope Realtime (${MODEL})`);
   console.log(`  POST /api/analyze  → DashScope Vision (${VISION_MODEL})`);
-  console.log(`  WS   /realtime     → Qwen Realtime (${MODEL})`);
 });

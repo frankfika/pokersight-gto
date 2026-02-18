@@ -23,20 +23,33 @@ export interface ParsedResponse {
   analysis: AnalysisData | null;
 }
 
+/** Known field labels — used to stop extraction at the next field boundary */
+const FIELD_LABELS = ['ACTION', '预判', '预判加注额', '加注额', '手牌', '公共牌', '底池', '阶段', '分析', '位置', '跟注', '赔率', 'SPR'];
+
 /** Extract a labeled field from structured AI output, e.g. "手牌: Ah Kd" */
 export function extractField(text: string, key: string): string {
-  const m = text.match(new RegExp(`${key}[:：]\\s*(.+)`));
+  // Build a boundary pattern that stops at the next known field label (on same line)
+  const others = FIELD_LABELS.filter(l => l !== key).join('|');
+  const re = new RegExp(`${key}[:：]\\s*(.+?)(?=\\s+(?:${others})[:：]|$)`, 'm');
+  const m = text.match(re);
   return m ? m[1].trim() : "";
 }
 
 /** Determine action type and display string from raw text */
-export function detectAction(raw: string, fullText: string): { display: string; type: AdviceType } {
+export function detectAction(raw: string, fullText: string, raiseAmt?: string): { display: string; type: AdviceType } {
   const up = raw.toUpperCase();
 
   if (up.includes("ALL-IN") || up.includes("ALLIN") || raw.includes("全压")) {
     return { type: 'ACTION', display: '全压 ALL-IN' };
   }
   if (up.includes("RAISE") || up.includes("BET") || raw.includes("加注")) {
+    // 优先使用结构化的加注额字段
+    if (raiseAmt) {
+      // 提取数字部分用于大字显示，如 "底池2/3=200" → "加注 200"
+      const numMatch = raiseAmt.match(/=\s*(\d+)/);
+      const amount = numMatch ? numMatch[1] : raiseAmt.match(/(\d+)/)?.[1];
+      if (amount) return { type: 'ACTION', display: `加注 ${amount}` };
+    }
     const m = raw.match(/(?:RAISE|BET|加注)\s*(\d+)/i) || fullText.match(/(?:RAISE|BET|加注)\s*(\d+)/i);
     return { type: 'ACTION', display: m ? `加注 ${m[1]}` : '加注 RAISE' };
   }
@@ -52,8 +65,19 @@ export function detectAction(raw: string, fullText: string): { display: string; 
   if (up.includes("READY") || raw.includes("准备") || raw.includes("即将")) {
     // READY 状态：即将轮到Hero，提前给出建议
     // 从 fullText 中提取具体建议（RAISE/CALL/FOLD 等）
-    const readyAction = fullText.match(/建议(加注|跟注|弃牌|过牌|全压)/);
-    const hint = readyAction ? readyAction[1] : '准备行动';
+    const readyAction = fullText.match(/建议(加注|跟注|弃牌|过牌|全压)/)
+      || fullText.match(/应(FOLD|CALL|RAISE|CHECK|弃牌|跟注|加注|过牌)/i)
+      || fullText.match(/则(FOLD|CALL|RAISE|弃牌|跟注|加注)/i)
+      || fullText.match(/必须(弃牌|跟注|加注|过牌)/);
+    let hint = '准备行动';
+    if (readyAction) {
+      const action = readyAction[1].toUpperCase();
+      if (action === 'FOLD' || action === '弃牌') hint = '预判: 弃牌';
+      else if (action === 'CALL' || action === '跟注') hint = '预判: 跟注';
+      else if (action.includes('RAISE') || action === '加注') hint = '预判: 加注';
+      else if (action === 'CHECK' || action === '过牌') hint = '预判: 过牌';
+      else hint = '预判: ' + readyAction[1];
+    }
     return { type: 'READY', display: hint };
   }
   if (up.includes("WAIT") || raw.includes("等待")) {
@@ -81,6 +105,8 @@ export function parsePokerResponse(text: string): ParsedResponse {
   const odds     = extractField(text, '赔率');
   const spr      = extractField(text, 'SPR');
   const detail   = extractField(text, '分析');
+  const raiseAmt = extractField(text, '加注额');
+  const preRaiseAmt = extractField(text, '预判加注额');
 
   // ── 1b. Fallback: if no structured fields at all, use full text as detail ──
   const hasAnyField = !!(hand || board || stage || detail);
@@ -96,18 +122,33 @@ export function parsePokerResponse(text: string): ParsedResponse {
     : null;
 
   // ── 2. Determine action ────────────────────────────────────────
-  // Priority: ACTION: field → first line → full-text scan
-  const actionFieldVal = extractField(text, 'ACTION');
-  if (actionFieldVal) {
-    return { ...detectAction(actionFieldVal, text), analysis };
+  // Priority: ACTION: field(s) → first line → full-text scan
+  // Check ALL ACTION: lines and use the first one with a valid action
+  const actionMatches = text.matchAll(/ACTION[:：]\s*(.+)/gi);
+  for (const m of actionMatches) {
+    const result = detectAction(m[1].trim(), text, raiseAmt);
+    if (result.type === 'NEUTRAL') {
+      // WAITING — check for 预判 field to upgrade to READY
+      const preAction = extractField(text, '预判');
+      if (preAction) {
+        const preResult = detectAction(preAction, text, preRaiseAmt);
+        if (preResult.type !== 'WARNING' && preResult.type !== 'NEUTRAL') {
+          return { display: '预判: ' + preResult.display, type: 'READY', analysis };
+        }
+      }
+      return { ...result, analysis };
+    }
+    if (result.type !== 'WARNING') {
+      return { ...result, analysis };
+    }
   }
 
   const firstLine = text.split('\n')[0].trim();
-  const firstLineResult = detectAction(firstLine, text);
+  const firstLineResult = detectAction(firstLine, text, raiseAmt);
   if (firstLineResult.type !== 'WARNING') {
     return { ...firstLineResult, analysis };
   }
 
   // Full-text fallback
-  return { ...detectAction(text, text), analysis };
+  return { ...detectAction(text, text, raiseAmt), analysis };
 }
