@@ -1,3 +1,4 @@
+import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -8,9 +9,13 @@ dotenv.config({ path: path.resolve(__dirname, '../.env.local') });
 
 const PORT = process.env.WS_PROXY_PORT ? Number(process.env.WS_PROXY_PORT) : 3301;
 const MODEL = process.env.QWEN_REALTIME_MODEL || 'qwen3-omni-flash-realtime';
+const VISION_MODEL = process.env.QWEN_VISION_MODEL || 'qwen-vl-max';
 const REGION = process.env.DASHSCOPE_REGION || 'cn';
 const BASE = REGION === 'intl' ? 'wss://dashscope-intl.aliyuncs.com' : 'wss://dashscope.aliyuncs.com';
 const TARGET = `${BASE}/api-ws/v1/realtime?model=${encodeURIComponent(MODEL)}`;
+const DASHSCOPE_HTTP_BASE = REGION === 'intl'
+  ? 'https://dashscope-intl.aliyuncs.com'
+  : 'https://dashscope.aliyuncs.com';
 const API_KEY = process.env.DASHSCOPE_API_KEY;
 
 if (!API_KEY) {
@@ -18,7 +23,118 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-const wss = new WebSocketServer({ port: PORT, path: '/realtime' });
+// ── HTTP Server ──────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  // CORS headers for all responses
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/analyze') {
+    // Read body
+    let body = '';
+    for await (const chunk of req) body += chunk;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      return;
+    }
+
+    const { image, systemPrompt } = parsed;
+    if (!image) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing image field' }));
+      return;
+    }
+
+    // Build DashScope OpenAI-compatible request
+    const apiUrl = `${DASHSCOPE_HTTP_BASE}/compatible-mode/v1/chat/completions`;
+    const payload = {
+      model: VISION_MODEL,
+      stream: true,
+      messages: [
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${image}` },
+            },
+            { type: 'text', text: '请分析这张扑克牌桌截图。' },
+          ],
+        },
+      ],
+    };
+
+    console.log(`[Proxy] POST /api/analyze → ${VISION_MODEL} (image ${Math.round(image.length / 1024)}KB)`);
+
+    try {
+      const upstream = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!upstream.ok) {
+        const errText = await upstream.text();
+        console.error(`[Proxy] DashScope error ${upstream.status}:`, errText);
+        res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `DashScope API error: ${upstream.status}`, detail: errText }));
+        return;
+      }
+
+      // Pipe SSE stream to client
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        res.write(chunk);
+      }
+
+      res.end();
+      console.log('[Proxy] SSE stream completed');
+    } catch (err) {
+      console.error('[Proxy] Fetch error:', err?.message || err);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Upstream fetch failed', detail: err?.message }));
+      } else {
+        res.end();
+      }
+    }
+    return;
+  }
+
+  // Default: 404 for unknown routes
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+// ── WebSocket (backward compat) ──────────────────────────────────
+const wss = new WebSocketServer({ server, path: '/realtime' });
 
 wss.on('connection', (client) => {
   console.log('[Proxy] Client connected, connecting upstream to', TARGET);
@@ -26,7 +142,6 @@ wss.on('connection', (client) => {
     headers: { Authorization: `Bearer ${API_KEY}` },
   });
 
-  // 缓存 upstream 未就绪时收到的客户端消息，连接后按序转发
   const pendingMessages = [];
   let upstreamReady = false;
 
@@ -34,7 +149,6 @@ wss.on('connection', (client) => {
     console.log('[Proxy] Upstream connected');
     upstreamReady = true;
 
-    // 转发缓存的消息
     if (pendingMessages.length > 0) {
       console.log(`[Proxy] Flushing ${pendingMessages.length} buffered message(s)`);
       for (const msg of pendingMessages) {
@@ -50,7 +164,6 @@ wss.on('connection', (client) => {
 
   upstream.on('message', (data) => {
     const text = data.toString();
-    // 只截断超长的 audio/image 数据，保留完整的控制消息和错误信息
     try {
       const ev = JSON.parse(text);
       if (ev.type === 'error' || ev.type?.endsWith('.created') || ev.type?.endsWith('.updated') || ev.type?.endsWith('.done')) {
@@ -87,7 +200,6 @@ wss.on('connection', (client) => {
     const text = data.toString();
     try {
       const ev = JSON.parse(text);
-      // 完整打印控制消息，截断 audio/image 数据
       if (ev.type === 'session.update' || ev.type === 'response.create') {
         console.log('[Proxy] Client msg:', text);
       } else {
@@ -97,7 +209,6 @@ wss.on('connection', (client) => {
       console.log('[Proxy] Client msg (raw):', text.substring(0, 200));
     }
 
-    // 必须转为 string 发送 (text frame)，Qwen API 不接受 binary frame 的 JSON
     const strData = data.toString();
     if (upstreamReady && upstream.readyState === WebSocket.OPEN) {
       upstream.send(strData);
@@ -112,4 +223,8 @@ wss.on('connection', (client) => {
   });
 });
 
-console.log(`Qwen Realtime WS proxy listening on ws://localhost:${PORT}/realtime -> ${TARGET}`);
+server.listen(PORT, () => {
+  console.log(`Qwen proxy listening on http://localhost:${PORT}`);
+  console.log(`  POST /api/analyze  → DashScope Vision (${VISION_MODEL})`);
+  console.log(`  WS   /realtime     → Qwen Realtime (${MODEL})`);
+});

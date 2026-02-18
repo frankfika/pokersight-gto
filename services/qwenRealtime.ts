@@ -3,33 +3,74 @@ declare const process: any;
 
 interface QwenRealtimeConfig {
   onStateChange: (state: ConnectionState) => void;
-  onTranscription: (text: string) => void;
+  onTranscription: (text: string) => void; // 完整响应（response.done 后）
+  onDelta: (text: string) => void;          // 流式 delta（实时显示 AI 在打字）
+  onResponseDone: () => void;               // 通知 PokerHUD 发下一帧
   onError: (error: string) => void;
 }
 
 const WEPOKER_SYSTEM_PROMPT = `
-ROLE: WePoker 实时GTO分析专家 (中文界面识别 + 英文标准输出)
-CONTEXT:
-你正在观看 WePoker (微扑克) 的实时画面流。
-OBJECTIVE:
-1. 识别手牌、公共牌、底池大小、各玩家筹码
-2. 判断是否轮到玩家操作
-3. 基于GTO策略给出最优决策
-STRICT OUTPUT:
-"FOLD"|"CHECK"|"CALL"|"RAISE [金额]"|"ALL-IN"|"WAITING"
+你是 WePoker 实时GTO分析助手。每帧画面你必须：
+
+## 界面识别
+- 屏幕最下方的玩家 = Hero（我）
+- Hero手牌：头像旁2张牌的点数+花色（如 Ah Kd, 7s 2c）
+- 公共牌：牌桌中央横排 0-5 张牌
+- 底池：牌桌中上方数字
+- 庄位：带"D"标记的玩家
+- 盲注：SB(小盲)/BB(大盲)位的筹码数字
+- 需跟注金额：底部操作按钮旁的数字
+- 是否我的回合：底部操作按钮是否亮起（弃牌/过牌/跟注/加注/全压）
+- 弃牌玩家：显示"弃牌"字样的头像
+
+## 计算
+- 赔率% = 跟注额 / (底池 + 跟注额) × 100
+- SPR = Hero筹码 / 底池
+- 位置：相对庄位D，依次为 BTN/CO/HJ/MP/UTG/SB/BB
+
+## 严格输出格式（必须按此格式，每项一行）
+ACTION: [FOLD|CHECK|CALL|RAISE 金额|ALL-IN|WAITING]
+手牌: [如 Ah Kd 或 未知]
+公共牌: [如 Ks 7h 2c 或 无]
+阶段: [翻牌前|翻牌|转牌|河牌]
+位置: [BTN/CO/HJ/MP/UTG/SB/BB]
+底池: [数字]
+跟注: [数字或0]
+赔率: [xx.x%或-]
+SPR: [数字或-]
+分析: [2-4句详细分析：手牌强度、位置优势、赔率是否合算、对手范围判断、建议理由]
+
+## 输出示例
+ACTION: RAISE 120
+手牌: Ah Kd
+公共牌: Ks 7h 2c
+阶段: 翻牌
+位置: BTN
+底池: 80
+跟注: 0
+赔率: -
+SPR: 18.5
+分析: 翻牌拿到顶对顶踢(TPTK)，K72彩虹面干燥无顺无花。BTN位有位置优势，对手范围宽。标准3/4底池价值下注60，既能从KJ/KT/KQ获得价值，也能让A高弃牌。
+
+ACTION: WAITING
+手牌: 未知
+公共牌: 无
+阶段: 翻牌前
+位置: BB
+底池: 60
+跟注: 0
+赔率: -
+SPR: -
+分析: 当前不是我的回合，等待其他玩家行动。
 `;
 
-function b64(buf: Uint8Array) {
-  let binary = "";
-  for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-  return btoa(binary);
-}
 
 export class QwenRealtimeService {
   private ws: WebSocket | null = null;
   private cfg: QwenRealtimeConfig;
   private connecting = false;
   private url: string;
+  private responseBuffer = "";
 
   constructor(cfg: QwenRealtimeConfig) {
     this.cfg = cfg;
@@ -54,9 +95,17 @@ export class QwenRealtimeService {
           const ev = JSON.parse(typeof evt.data === "string" ? evt.data : "");
           const t = ev?.type;
           if ((t === "response.text.delta" || t === "response.audio_transcript.delta") && ev.delta) {
-            this.cfg.onTranscription(ev.delta);
+            this.responseBuffer += ev.delta;
+            // 实时流式回调，让 UI 显示 AI 正在打字
+            this.cfg.onDelta(ev.delta);
           } else if (t === "response.done") {
-            // response cycle complete
+            // 发送完整累积文本用于结构化解析
+            if (this.responseBuffer.trim()) {
+              this.cfg.onTranscription(this.responseBuffer.trim());
+            }
+            this.responseBuffer = "";
+            // 通知 PokerHUD 可以发下一帧了
+            this.cfg.onResponseDone();
           } else if (t === "error") {
             const errMsg = ev.error?.message || ev.error?.code || JSON.stringify(ev.error);
             console.error('[QwenRealtime] Server error event:', JSON.stringify(ev));
@@ -69,7 +118,7 @@ export class QwenRealtimeService {
               session: {
                 modalities: ["text", "audio"],
                 instructions: WEPOKER_SYSTEM_PROMPT,
-                turn_detection: null, // 关闭 VAD，使用手动 commit + response.create
+                turn_detection: null,
               },
             });
           } else if (t === "session.updated") {
@@ -118,12 +167,14 @@ export class QwenRealtimeService {
   public async sendFrame(base64Image: string) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const clean = base64Image.includes(",") ? base64Image.split(",")[1] : base64Image;
-    // 发送静音 audio（API 要求至少一次 audio 在 image 之前）
-    const silent = new Uint8Array(3200);
-    this.send({ type: "input_audio_buffer.append", audio: b64(silent) });
-    // 发送图片帧
+    // Qwen Omni Realtime 必须有 audio，否则不触发响应
+    // 8000 bytes ≈ 167ms 静音 (24kHz 16-bit mono PCM)，满足最小要求
+    const silent = new Uint8Array(8000);
+    let binary = "";
+    for (let i = 0; i < silent.length; i++) binary += String.fromCharCode(silent[i]);
+    const silentB64 = btoa(binary);
+    this.send({ type: "input_audio_buffer.append", audio: silentB64 });
     this.send({ type: "input_image_buffer.append", image: clean });
-    // 手动 commit + 触发响应（需要 turn_detection: null）
     this.send({ type: "input_audio_buffer.commit" });
     this.send({ type: "response.create" });
   }
