@@ -112,22 +112,89 @@ function isFoldRecommended(text: string): boolean {
 }
 
 /**
+ * Extract the recommended action from analysis text
+ * Returns: 'FOLD' | 'CALL' | 'CHECK' | 'RAISE' | 'ALLIN' | null
+ */
+function extractRecommendedAction(text: string): string | null {
+  // 优先检查明确的结论性语句
+  const conclusionPatterns = [
+    /(?:建议|应|选择|最优|应当|应该)(全压|ALL[-]?IN)/i,
+    /(?:建议|应|选择|最优|应当|应该)(加注|RAISE|BET)/i,
+    /(?:建议|应|选择|最优|应当|应该)(跟注|CALL)/i,
+    /(?:建议|应|选择|最优|应当|应该)(过牌|CHECK)/i,
+    /(?:建议|应|选择|最优|应当|应该)(弃牌|FOLD)/i,
+    /(?:结论|最终|综上).{0,5}(全压|加注|跟注|过牌|弃牌)/,
+  ];
+
+  for (const pattern of conclusionPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const action = match[1].toUpperCase();
+      if (action === 'ALLIN' || action === '全压') return 'ALLIN';
+      if (action === 'RAISE' || action === 'BET' || action === '加注') return 'RAISE';
+      if (action === 'CALL' || action === '跟注') return 'CALL';
+      if (action === 'CHECK' || action === '过牌') return 'CHECK';
+      if (action === 'FOLD' || action === '弃牌') return 'FOLD';
+    }
+  }
+  return null;
+}
+
+/**
  * Consistency check: if ACTION contradicts the analysis detail, trust the analysis.
  * e.g. ACTION=RAISE but analysis says "应弃牌" → override to FOLD
  * NOTE: FOLD is stable - once FOLD, always FOLD (won't be corrected to RAISE/CALL)
  */
 function fixContradiction(result: { display: string; type: AdviceType }, detail: string, fullText: string, raiseAmt?: string): { display: string; type: AdviceType } {
   if (!detail) return result;
-  const d = detail;
 
   // FOLD 建议：保持稳定，不被修正
   if (result.type === 'FOLD') {
     return result;
   }
 
-  // ACTION is aggressive (RAISE/CALL/CHECK) but analysis recommends FOLD
+  // 从分析中提取建议的行动
+  const recommendedAction = extractRecommendedAction(detail) || extractRecommendedAction(fullText);
+
+  if (recommendedAction) {
+    // 如果分析建议 FOLD，覆盖任何其他行动
+    if (recommendedAction === 'FOLD') {
+      return { type: 'FOLD', display: '弃牌 FOLD' };
+    }
+
+    // 如果分析与当前结果不一致，以分析为准
+    const currentIsAction = result.type === 'ACTION'; // RAISE/BET/ALLIN
+    const currentIsGood = result.type === 'GOOD'; // CALL/CHECK
+
+    if (recommendedAction === 'CALL' && currentIsAction) {
+      return { type: 'GOOD', display: '跟注 CALL' };
+    }
+    if (recommendedAction === 'CHECK' && currentIsAction) {
+      return { type: 'GOOD', display: '过牌 CHECK' };
+    }
+    if (recommendedAction === 'ALLIN' && currentIsGood) {
+      return { type: 'ACTION', display: '全压 ALL-IN' };
+    }
+    if (recommendedAction === 'RAISE' && currentIsGood) {
+      // 从 raiseAmt 或底池估算加注额
+      if (raiseAmt) {
+        const numMatch = raiseAmt.match(/=\s*(\d+)/);
+        const amount = numMatch ? numMatch[1] : raiseAmt.match(/(\d+)/)?.[1];
+        if (amount) return { type: 'ACTION', display: `加注 ${amount}` };
+      }
+      const potMatch = fullText.match(/底池[:：]\s*(\d+)/);
+      if (potMatch) {
+        const potVal = parseInt(potMatch[1], 10);
+        const raiseVal = Math.round(potVal * 2 / 3);
+        return { type: 'ACTION', display: `加注 ${raiseVal}` };
+      }
+      return { type: 'ACTION', display: '加注 RAISE' };
+    }
+  }
+
+  // 旧的 FOLD 检查作为后备
   if (result.type === 'ACTION' || result.type === 'GOOD') {
-    if (isFoldRecommended(d) || isFoldRecommended(fullText)) {
+    if (isFoldRecommended(detail) || isFoldRecommended(fullText)) {
       return { type: 'FOLD', display: '弃牌 FOLD' };
     }
   }

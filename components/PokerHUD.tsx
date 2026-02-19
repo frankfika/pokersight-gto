@@ -1,611 +1,249 @@
-
 import { useRef, useState, useCallback, useEffect } from 'react';
-import { QwenRealtimeService } from '../services/qwenRealtime';
-import { ConnectionState } from '../types';
-import { parsePokerResponse, AnalysisData, AdviceType } from '../utils/parseResponse';
-import { detectActionButtons, detectButtonTransition, ButtonDetectionResult } from '../utils/buttonDetector';
+import { useCaptureEngine } from '../hooks/useCaptureEngine';
+import { useAIDispatcher } from '../hooks/useAIDispatcher';
+import { useAnalysisFSM } from '../hooks/useAnalysisFSM';
+import { ConnectionState, detectActionButtons } from '../types/poker';
+import type { Frame, DispatchMode } from '../types/poker';
 
 const FRAME_RATE = 1.0;
-const JPEG_QUALITY = 0.85;
 const MAX_IMAGE_DIMENSION = 1024;
 
 type CaptureMode = 'TAB' | 'CAMERA';
 
 const isMacOS = (): boolean =>
-  typeof navigator !== 'undefined' &&
-  /Mac|Macintosh/i.test(navigator.userAgent);
-
+  typeof navigator !== 'undefined' && /Mac|Macintosh/i.test(navigator.userAgent);
 
 const PokerHUD = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const serviceRef = useRef<QwenRealtimeService | null>(null);
-  const frameIntervalRef = useRef<number | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const modeRef = useRef<DispatchMode>('MANUAL');
+  const sendFrameRef = useRef<((frame: Frame, force?: boolean) => void) | null>(null);
+  const startLoopRef = useRef<(() => void) | null>(null);
+  const captureOnceRef = useRef<(() => Frame | null) | null>(null);
 
   const [captureMode, setCaptureMode] = useState<CaptureMode>('TAB');
-  const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
-  const [lastAdvice, setLastAdvice] = useState<string>("就绪");
-  const [adviceType, setAdviceType] = useState<AdviceType>('NEUTRAL');
-  const [errorMsg, setErrorMsg] = useState<string>("");
   const [debugImage, setDebugImage] = useState<string | null>(null);
-  const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
-  const [isThinking, setIsThinking] = useState<boolean>(false);
-  const [streamingText, setStreamingText] = useState<string>("");
+  const [errorMsg, setErrorMsg] = useState<string>('');
+  const [isActive, setIsActive] = useState(false);
+  const [showPreview, setShowPreview] = useState(true);
 
-  // 记住上一次"轮到我"的行动建议，WAITING 时保留显示
-  const [pinnedAdvice, setPinnedAdvice] = useState<string | null>(null);
-  const [pinnedAnalysis, setPinnedAnalysis] = useState<AnalysisData | null>(null);
-  const [isWaiting, setIsWaiting] = useState<boolean>(false);
-  // 手动模式：暂停自动检测，等待用户点击触发
-  const [isPaused, setIsPaused] = useState<boolean>(false);
-  const isPausedRef = useRef<boolean>(false);
-  // 标记是否为手动触发的检测（手动触发后响应完成自动暂停）
-  const isManualTriggerRef = useRef<boolean>(false);
+  // Ref to track uiState synchronously for shouldSuppressStreaming
+  const uiStateRef = useRef<{ phase: string }>({ phase: 'WAITING' });
 
-  // Ref 镜像 isWaiting，供 useCallback 闭包内访问最新值
-  const isWaitingRef = useRef<boolean>(false);
-  // Ref 镜像 adviceType，供 sendLatestFrame 判断是否已有有效行动
-  const adviceTypeRef = useRef<AdviceType>('NEUTRAL');
-  // 流式累积文本 + 早期行动检测标记
-  const streamingAccRef = useRef<string>("");
-  const earlyActionDetectedRef = useRef<boolean>(false);
+  // Analysis FSM handles anti-flicker, state transitions
+  const {
+    state: uiState,
+    pinnedAnalysis,
+    handleResponse,
+    handleStreamDelta,
+    handleButtonAppeared,
+    handleButtonsDetectedWhileWaiting,
+    reset: resetFSM,
+  } = useAnalysisFSM();
 
-  // 去重：记录上一次响应，避免相同状态重复触发UI更新
-  const lastStateRef = useRef<{ type: AdviceType; display: string } | null>(null);
+  // Keep uiStateRef in sync
+  useEffect(() => {
+    uiStateRef.current = uiState;
+  }, [uiState]);
 
-  // 最新帧缓存，供响应驱动发送使用
-  const latestFrameRef = useRef<string | null>(null);
-  // 上一次实际发送给 AI 的帧（用于变化检测）
-  const lastSentFrameRef = useRef<string | null>(null);
-  // 防止响应驱动时重入
-  const sendingRef = useRef<boolean>(false);
-  // 帧等待发送（AI 忙时有新变化帧，响应完后立即发）
-  const pendingFrameRef = useRef<boolean>(false);
-  // 上次发帧时间戳（用于 10s 兜底强制发送）
-  const lastSendTimeRef = useRef<number>(0);
-  // pinnedAdvice 的 ref 镜像，供 captureAndDispatch 闭包访问
-  const pinnedAdviceRef = useRef<string | null>(null);
-  // 防闪烁：连续 WAITING 计数，ACTION→WAITING 快速切换时需要 2 次连续确认
-  const waitingConfirmCountRef = useRef<number>(0);
-  // 防误判：连续 ACTION 计数，WAITING→ACTION 需要 2 次连续确认
-  const actionConfirmCountRef = useRef<number>(0);
-  // 最新按钮检测结果（每帧更新），供 handleTranscription/onDelta 参考
-  const buttonResultRef = useRef<ButtonDetectionResult>({
-    hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW',
+  // Handle button disappear event
+  const handleButtonDisappear = useCallback(() => {
+    console.log('🔴 Buttons disappeared → user acted, clearing advice');
+    resetFSM();
+  }, [resetFSM]);
+
+  // Handle AI response - defined early for useAIDispatcher
+  const handleAIResponse = useCallback((response: any) => {
+    const btnResult = detectActionButtons(canvasRef.current!);
+    handleResponse(response, btnResult);
+  }, [handleResponse]);
+
+  // AI Dispatcher
+  const {
+    connectionState,
+    isThinking,
+    streamingText,
+    mode,
+    connect,
+    disconnect,
+    sendFrame,
+    setMode: setModeInternal,
+  } = useAIDispatcher({
+    onResponse: handleAIResponse,
+    onStreamDelta: (accumulatedText) => {
+      // Wire stream early action detection (#3)
+      const btnResult = detectActionButtons(canvasRef.current!);
+      handleStreamDelta(accumulatedText, btnResult);
+    },
+    onStreamEnd: () => {},
+    onError: (msg, isNetwork) => {
+      setErrorMsg(msg);
+      if (isNetwork) {
+        // Stop capture on network error (#6)
+        stopCaptureRef.current?.();
+        setIsActive(false);
+      } else {
+        setTimeout(() => setErrorMsg(''), 3000);
+      }
+    },
+    onConnected: () => {
+      // Start capture loop only after WebSocket is connected (#1)
+      startLoopRef.current?.();
+    },
+    onReadyForNextFrame: () => {
+      // Auto-resend pending frame (#2)
+      const frame = captureOnceRef.current?.();
+      if (frame && sendFrameRef.current) {
+        sendFrameRef.current(frame, false);
+      }
+    },
+    shouldSuppressStreaming: () => {
+      // Suppress streaming text in WAITING/READY phase (#4)
+      const phase = uiStateRef.current.phase;
+      return phase === 'WAITING' || phase === 'READY';
+    },
   });
-  // 上一帧是否有按钮（用于状态变化检测）
-  const prevButtonStateRef = useRef<boolean>(false);
-  // ACTION 状态最近一次设置时间（用于判断是否已稳定）
-  const lastActionSetTimeRef = useRef<number>(0);
 
-  const stopCapture = useCallback(() => {
-    if (frameIntervalRef.current) {
-      window.clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) videoRef.current.srcObject = null;
-    latestFrameRef.current = null;
-    lastSentFrameRef.current = null;
-    sendingRef.current = false;
-    pendingFrameRef.current = false;
-    lastSendTimeRef.current = 0;
-    pinnedAdviceRef.current = null;
-    adviceTypeRef.current = 'NEUTRAL';
-    streamingAccRef.current = "";
-    earlyActionDetectedRef.current = false;
-    isWaitingRef.current = false;
-    lastStateRef.current = null;
-    unchangedCountRef.current = 0;
-    waitingConfirmCountRef.current = 0;
-    actionConfirmCountRef.current = 0;
-    buttonResultRef.current = { hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW' };
-    prevButtonStateRef.current = false;
-    lastActionSetTimeRef.current = 0;
-    setDebugImage(null);
-    setIsThinking(false);
-    setStreamingText("");
-  }, []);
+  // Ref for stopCapture (needed in onError which can't depend on hook return)
+  const stopCaptureRef = useRef<(() => void) | null>(null);
 
-  const handleTranscription = useCallback((text: string) => {
-    console.log('═══ AI Response ═══');
-    console.log(text);
-    const result = parsePokerResponse(text);
-    console.log('Parsed → Type:', result.type, '| Display:', result.display);
+  // Sync sendFrame to ref
+  useEffect(() => {
+    sendFrameRef.current = sendFrame;
+  }, [sendFrame]);
 
-    // SKIP = 非牌桌画面，不更新 UI
-    if (result.type === 'SKIP') return;
+  // Handle frame from capture engine - uses ref to avoid dependency cycle
+  const handleFrame = useCallback((frame: Frame, btnResult: any, transition: { appeared: boolean; disappeared: boolean; current: boolean }) => {
+    setDebugImage(frame.base64);
 
-    // WAITING / READY(预判) → 都视为"非我回合"
-    const waiting = result.type === 'NEUTRAL' || result.type === 'READY';
-
-    // ── 防闪烁/防误判：双向确认机制 ──
-    if (waiting) {
-      waitingConfirmCountRef.current++;
-      actionConfirmCountRef.current = 0;
-    } else {
-      actionConfirmCountRef.current++;
-      waitingConfirmCountRef.current = 0;
+    if (transition.appeared) {
+      console.log(`🟢 Buttons appeared (confidence=${btnResult.confidence})`);
+      handleButtonAppeared(); // Pre-increment actionConfirmCount (#8)
     }
 
-    // 防闪烁：当前显示 ACTION，AI 说 WAITING
-    // 规则：像素无按钮 → 立即接受（两者一致）
-    //       像素还有按钮 + ACTION<3s → 需要 2 次确认
-    //       ACTION>3s → 立即接受
-    const currentlyShowingAction = !isWaitingRef.current &&
-      ['ACTION', 'FOLD', 'GOOD'].includes(adviceTypeRef.current);
-    if (waiting && currentlyShowingAction) {
-      const actionAge = Date.now() - lastActionSetTimeRef.current;
-      const buttonsStillVisible = buttonResultRef.current.hasRedButton;
-      if (buttonsStillVisible && actionAge < 3000 && waitingConfirmCountRef.current < 2) {
-        console.log(`⏸ 防闪烁: WAITING #${waitingConfirmCountRef.current}/2, 按钮仍可见, ACTION刚设置${actionAge}ms前`);
-        if (result.type === 'READY') {
-          setPinnedAdvice(result.display);
-          pinnedAdviceRef.current = result.display;
-          if (result.analysis) setPinnedAnalysis(result.analysis);
-        }
-        return;
-      }
-      // 像素无按钮 / ACTION已稳定超过3s / 已有2次连续WAITING → 直接清除
-      console.log(`✅ WAITING确认（ACTION持续${actionAge}ms, buttons=${buttonsStillVisible}, count=${waitingConfirmCountRef.current}）`);
+    if (transition.disappeared) {
+      handleButtonDisappear();
     }
 
-    // 像素纠错：AI 说 WAITING 但像素检测到红色按钮 → AI 视觉错误，拒绝并更新分析数据
-    if (waiting && buttonResultRef.current.hasRedButton) {
-      console.log(`⚠️ AI说WAITING但像素检测到红色按钮 (confidence=${buttonResultRef.current.confidence}, density=${buttonResultRef.current.redDensity.toFixed(4)})，拒绝WAITING`);
-      // 仍然更新分析数据（手牌/底池等信息可能有用）
-      if (result.analysis) {
-        setPinnedAnalysis(result.analysis);
-      }
-      return;
+    // READY pre-display: buttons detected while WAITING + have cached analysis (#9)
+    if (transition.current && uiStateRef.current.phase === 'WAITING') {
+      handleButtonsDetectedWhileWaiting();
     }
 
-    // 防误判：当前 WAITING，AI 说 ACTION → 根据像素置信度决定确认次数
-    // HIGH(红+蓝) = 1次，MEDIUM(红) = 1次，LOW(无按钮) = 2次
-    const currentlyWaiting = isWaitingRef.current;
-    if (!waiting && currentlyWaiting) {
-      const confidence = buttonResultRef.current.confidence;
-      const requiredConfirms = confidence === 'HIGH' ? 1 : confidence === 'MEDIUM' ? 1 : 2;
-      if (actionConfirmCountRef.current < requiredConfirms) {
-        console.log(`⏸ 防误判: ACTION #${actionConfirmCountRef.current}/${requiredConfirms} (confidence=${confidence}), 暂不切换`);
-        return;
-      }
-      console.log(`✅ ACTION确认 (confidence=${confidence}, count=${actionConfirmCountRef.current})`);
+    // AUTO mode: automatically send frame to AI
+    if (modeRef.current === 'AUTO' && !transition.disappeared && sendFrameRef.current) {
+      sendFrameRef.current(frame, transition.appeared);
     }
+  }, [handleButtonDisappear, handleButtonAppeared, handleButtonsDetectedWhileWaiting]);
 
-    // 去重：避免相同状态重复触发UI更新（但 analysis 始终更新）
-    const lastState = lastStateRef.current;
-    let isDuplicate = false;
-    if (lastState) {
-      const wasWaiting = lastState.type === 'NEUTRAL' || lastState.type === 'READY';
-      const isNowWaiting = waiting;
-      if (wasWaiting && isNowWaiting) {
-        isDuplicate = true;
-      } else if (lastState.type === result.type && lastState.display === result.display) {
-        isDuplicate = true;
-      }
-    }
+  // Capture engine
+  const { start: startCapture, startLoop, stop: stopCapture, captureOnce } = useCaptureEngine({
+    videoRef,
+    canvasRef,
+    onFrame: handleFrame,
+    onStreamEnded: () => {
+      // Screen share ended → disconnect WebSocket (#7)
+      disconnect();
+      resetFSM();
+    },
+  });
 
-    // 即使是重复状态，也始终更新 analysis 数据（牌面/底池等可能已变）
-    if (result.analysis) {
-      if (waiting) {
-        setPinnedAnalysis(result.analysis);
-      } else {
-        setAnalysis(result.analysis);
-        setPinnedAnalysis(result.analysis);
-      }
-    }
+  // Sync refs
+  useEffect(() => {
+    startLoopRef.current = startLoop;
+  }, [startLoop]);
+  useEffect(() => {
+    captureOnceRef.current = captureOnce;
+  }, [captureOnce]);
+  useEffect(() => {
+    stopCaptureRef.current = stopCapture;
+  }, [stopCapture]);
 
-    if (isDuplicate) {
-      console.log('⏭ Same action, analysis updated only');
-      return;
-    }
+  // Update isActive based on connection state
+  useEffect(() => {
+    setIsActive(connectionState === ConnectionState.CONNECTED);
+  }, [connectionState]);
 
-    lastStateRef.current = { type: result.type, display: result.display };
-    console.log('✅ State changed:', result.type, '→', result.display);
-    console.log('═══════════════════');
+  // Sync mode to ref for use in callbacks
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
-    setStreamingText("");
+  const setMode = useCallback((newMode: DispatchMode) => {
+    modeRef.current = newMode;
+    setModeInternal(newMode);
+  }, [setModeInternal]);
 
-    if (waiting) {
-      // 非我回合：强制切到 WAITING，清除旧行动显示
-      setIsWaiting(true);
-      isWaitingRef.current = true;
-      setLastAdvice('等待中...');
-      setAdviceType('NEUTRAL');
-      adviceTypeRef.current = 'NEUTRAL';
-      setIsThinking(false);
-      if (result.type === 'READY') {
-        setPinnedAdvice(result.display);
-        pinnedAdviceRef.current = result.display;
-      }
-    } else {
-      // 轮到我（ACTION/FOLD/GOOD）— 直接信任 AI，立即显示
-      lastActionSetTimeRef.current = Date.now();
-      setIsWaiting(false);
-      isWaitingRef.current = false;
-      setLastAdvice(result.display);
-      setAdviceType(result.type);
-      adviceTypeRef.current = result.type;
-      setPinnedAdvice(result.display);
-      pinnedAdviceRef.current = result.display;
-    }
-  }, []);
-
-  // 捕获最新帧并存入 ref（供响应驱动发送），同时更新预览
-  const captureLatestFrame = useCallback(() => {
-    if (!videoRef.current || !canvasRef.current) return;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx || video.readyState !== 4) return;
-
-    const scale = Math.min(MAX_IMAGE_DIMENSION / video.videoWidth, MAX_IMAGE_DIMENSION / video.videoHeight);
-    canvas.width = video.videoWidth * scale;
-    canvas.height = video.videoHeight * scale;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const base64 = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
-    latestFrameRef.current = base64;
-    setDebugImage(base64);
-  }, []);
-
-  // 连续未变化计数，用于渐进式退避
-  const unchangedCountRef = useRef<number>(0);
-
-  // 简单帧变化检测：比较 base64 字符串长度差异 + 采样比较
-  const isFrameChanged = useCallback((newFrame: string, oldFrame: string | null): boolean => {
-    if (!oldFrame) return true;
-    // 长度差异超过 12% 认为有变化（过滤掉动画/计时器等微小变化）
-    const lenDiff = Math.abs(newFrame.length - oldFrame.length) / oldFrame.length;
-    if (lenDiff > 0.12) return true;
-    // 采样比较：每隔 800 字符取一个字符，超过 25% 不同则认为有变化
-    const step = 800;
-    let diffCount = 0;
-    let sampleCount = 0;
-    for (let i = 0; i < Math.min(newFrame.length, oldFrame.length); i += step) {
-      sampleCount++;
-      if (newFrame[i] !== oldFrame[i]) diffCount++;
-    }
-    return sampleCount === 0 || (diffCount / sampleCount) > 0.25;
-  }, []);
-
-  // 纯发送：将 latestFrameRef 发给 AI（不截帧、不调度）
-  // force=true 时跳过冷却（按钮变化等高优先级事件）
-  const sendFrameToAI = useCallback((force = false) => {
-    if (sendingRef.current || !serviceRef.current || !latestFrameRef.current) return;
-    // 暂停模式下跳过自动发送（除非是手动触发 force=true）
-    if (isPausedRef.current && !force) return;
-    // 最小发送间隔 3 秒（force 时跳过）
-    if (!force && lastSendTimeRef.current > 0) {
-      const sinceLastSend = Date.now() - lastSendTimeRef.current;
-      if (sinceLastSend < 3000) return;
-    }
-    sendingRef.current = true;
-    lastSentFrameRef.current = latestFrameRef.current;
-    lastSendTimeRef.current = Date.now();
-    pendingFrameRef.current = false;
-    unchangedCountRef.current = 0;
-    // 重置流式累积
-    streamingAccRef.current = "";
-    earlyActionDetectedRef.current = false;
-    // thinking 状态仅在非WAITING且无有效行动时显示
-    const hasAction = ['ACTION', 'FOLD', 'GOOD', 'READY'].includes(adviceTypeRef.current);
-    if (!isWaitingRef.current && !hasAction) {
-      setIsThinking(true);
-      setStreamingText("");
-    }
-    serviceRef.current.sendFrame(latestFrameRef.current);
-  }, []);
-
-  // 手动触发检测：立即截帧并发送给 AI，收到结果后暂停
-  const manualTrigger = useCallback(() => {
-    if (!serviceRef.current || sendingRef.current) return;
-    // 立即截取最新帧
-    captureLatestFrame();
-    if (!latestFrameRef.current) return;
-    // 标记为手动触发
-    isManualTriggerRef.current = true;
-    // 强制发送（跳过冷却和暂停检查）
-    console.log('👆 手动触发检测');
-    sendingRef.current = true;
-    lastSentFrameRef.current = latestFrameRef.current;
-    lastSendTimeRef.current = Date.now();
-    pendingFrameRef.current = false;
-    unchangedCountRef.current = 0;
-    streamingAccRef.current = "";
-    earlyActionDetectedRef.current = false;
-    setIsThinking(true);
-    setStreamingText("");
-    serviceRef.current.sendFrame(latestFrameRef.current);
-  }, [captureLatestFrame]);
-
-  // 切换暂停状态
-  const togglePause = useCallback(() => {
-    const newPaused = !isPausedRef.current;
-    isPausedRef.current = newPaused;
-    setIsPaused(newPaused);
-    if (!newPaused) {
-      console.log('▶️ 继续自动检测');
-    } else {
-      console.log('⏸ 暂停自动检测');
-    }
-  }, []);
-
-  // 手动检测按钮：始终触发一次检测，响应后自动暂停
-  const handleManualDetect = useCallback(() => {
-    // 取消暂停状态（如果有）
-    if (isPausedRef.current) {
-      isPausedRef.current = false;
-      setIsPaused(false);
-    }
-    manualTrigger();
-  }, [manualTrigger]);
-
-  // 事件驱动帧调度：每秒截帧 + 帧差检测 + 按钮检测 + 智能发送
-  const startCaptureLoop = useCallback(() => {
-    if (frameIntervalRef.current) window.clearInterval(frameIntervalRef.current);
-    frameIntervalRef.current = window.setInterval(() => {
-      // 1. 截帧并更新预览
-      captureLatestFrame();
-      if (!latestFrameRef.current || !canvasRef.current) return;
-
-      // 2. 帧差检测
-      const changed = isFrameChanged(latestFrameRef.current, lastSentFrameRef.current);
-
-      if (changed) {
-        // 3a. 画面有变化：做按钮检测（增强版）
-        const btnResult = detectActionButtons(canvasRef.current);
-        buttonResultRef.current = btnResult;
-
-        // 检测按钮状态变化（出现/消失）
-        const transition = detectButtonTransition(prevButtonStateRef.current, btnResult);
-        prevButtonStateRef.current = transition.current;
-
-        if (transition.appeared) {
-          console.log(`🟢 按钮出现 (confidence=${btnResult.confidence}, red=${btnResult.redDensity.toFixed(4)})`);
-          // 预设确认计数，加速 WAITING→ACTION 转换
-          actionConfirmCountRef.current = Math.max(actionConfirmCountRef.current, 1);
-        }
-        if (transition.disappeared) {
-          console.log(`🔴 按钮消失 → 用户已行动，立即清除建议`);
-          // 用户已行动（弃牌/跟注/加注），立即清除建议，进入 WAITING
-          setIsWaiting(true);
-          isWaitingRef.current = true;
-          setLastAdvice('等待中...');
-          setAdviceType('NEUTRAL');
-          adviceTypeRef.current = 'NEUTRAL';
-          setIsThinking(false);
-          // 重置确认计数
-          waitingConfirmCountRef.current = 0;
-          actionConfirmCountRef.current = 0;
-          lastStateRef.current = null;
-        }
-
-        if (transition.current && isWaitingRef.current && pinnedAdviceRef.current) {
-          // 检测到按钮 + 正在等待 + 有缓存的预判建议 → 立即显示 READY
-          console.log('🎯 按钮检测到 + 有缓存READY → 立即显示');
-          setIsWaiting(false);
-          isWaitingRef.current = false;
-          setLastAdvice(pinnedAdviceRef.current);
-          setAdviceType('READY');
-          adviceTypeRef.current = 'READY';
-          lastStateRef.current = null;
-        }
-
-        // 3b. 按钮状态变化时优先发帧（高优先级事件，跳过冷却）
-        const shouldPrioritySend = transition.appeared || transition.disappeared;
-        if (!sendingRef.current) {
-          sendFrameToAI(shouldPrioritySend);
-        } else if (shouldPrioritySend) {
-          // 按钮变化是高优先级，标记 pending 确保响应完后立即发
-          pendingFrameRef.current = true;
-        } else {
-          pendingFrameRef.current = true;
-        }
-      } else {
-        // 4. 画面没变化
-        const elapsed = Date.now() - lastSendTimeRef.current;
-        if (elapsed > 15000 && !sendingRef.current) {
-          // 超过 15s 未发帧 → 强制发一次（安全兜底）
-          console.log('⏰ 15s 兜底发送');
-          sendFrameToAI();
-        }
-        // 否则跳过
-      }
-    }, 1000 / FRAME_RATE);
-  }, [captureLatestFrame, isFrameChanged, sendFrameToAI]);
-
+  // Toggle connection
   const toggleConnection = async () => {
-    if (connectionState !== ConnectionState.DISCONNECTED && connectionState !== ConnectionState.ERROR) {
+    if (isActive) {
       stopCapture();
-      serviceRef.current?.disconnect();
-      setConnectionState(ConnectionState.DISCONNECTED);
-      setLastAdvice("就绪");
-      setAdviceType('NEUTRAL');
-      setAnalysis(null);
-      setPinnedAdvice(null);
-      pinnedAdviceRef.current = null;
-      setPinnedAnalysis(null);
-      setIsWaiting(false);
-      adviceTypeRef.current = 'NEUTRAL';
-      streamingAccRef.current = "";
-      earlyActionDetectedRef.current = false;
-      isWaitingRef.current = false;
-      lastStateRef.current = null;
-      waitingConfirmCountRef.current = 0;
-      actionConfirmCountRef.current = 0;
-      buttonResultRef.current = { hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW' };
-      prevButtonStateRef.current = false;
-      lastActionSetTimeRef.current = 0;
+      disconnect();
+      resetFSM();
       return;
     }
 
-    setErrorMsg("");
-    setConnectionState(ConnectionState.CONNECTING);
+    setErrorMsg('');
 
     try {
-      let stream: MediaStream;
-
-      if (captureMode === 'TAB') {
-        if (!navigator.mediaDevices?.getDisplayMedia) {
-          throw new Error("此设备/浏览器不支持屏幕捕获");
-        }
-        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      } else {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
-          audio: false
-        });
-      }
-
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        try {
-          await videoRef.current.play();
-        } catch (e) {
-          console.warn('Video play interrupted:', e);
-        }
-      }
-
-      stream.getVideoTracks()[0].onended = () => {
-        stopCapture();
-        serviceRef.current?.disconnect();
-        setConnectionState(ConnectionState.DISCONNECTED);
-      };
-
-      if (!serviceRef.current) {
-        serviceRef.current = new QwenRealtimeService({
-          onStateChange: (state) => {
-            setConnectionState(state);
-            if (state === ConnectionState.CONNECTED) {
-              // 启动事件驱动帧调度循环（含预览+帧差+按钮检测+AI发送）
-              startCaptureLoop();
-            }
-          },
-          onTranscription: handleTranscription,
-          onDelta: (delta: string) => {
-            streamingAccRef.current += delta;
-            // WAITING/READY: 抑制流式文字显示，但继续做早期行动检测
-            if (!isWaitingRef.current && adviceTypeRef.current !== 'READY') {
-              setStreamingText((prev: string) => prev + delta);
-            }
-            // 流式早期行动检测：ACTION 行一出现就立即显示，不等完整响应
-            if (!earlyActionDetectedRef.current) {
-              const m = streamingAccRef.current.match(/ACTION[:：]\s*(CHECK|FOLD|CALL|RAISE|ALLIN|BET|WAITING|SKIP)/i);
-              if (m) {
-                earlyActionDetectedRef.current = true;
-                const earlyResult = parsePokerResponse(streamingAccRef.current);
-                if (earlyResult.type !== 'SKIP') {
-                  const w = earlyResult.type === 'NEUTRAL' || earlyResult.type === 'READY';
-                  if (w) {
-                    // 防闪烁：ACTION→WAITING 需要连续确认（与 handleTranscription 一致）
-                    waitingConfirmCountRef.current++;
-                    const showingAction = !isWaitingRef.current &&
-                      ['ACTION', 'FOLD', 'GOOD'].includes(adviceTypeRef.current);
-                    const buttonsStillVisible = buttonResultRef.current.hasRedButton;
-                    const actionAge = Date.now() - lastActionSetTimeRef.current;
-                    if (showingAction && buttonsStillVisible && actionAge < 3000 && waitingConfirmCountRef.current < 2) {
-                      // 暂不切换，按钮仍可见且ACTION刚设置
-                    } else {
-                      setIsWaiting(true);
-                      isWaitingRef.current = true;
-                      setLastAdvice('等待中...');
-                      setAdviceType('NEUTRAL');
-                      adviceTypeRef.current = 'NEUTRAL';
-                      setIsThinking(false);
-                    }
-                  } else {
-                    // 轮到我 — 根据像素置信度决定确认次数
-                    actionConfirmCountRef.current++;
-                    waitingConfirmCountRef.current = 0;
-                    const confidence = buttonResultRef.current.confidence;
-                    const requiredConfirms = confidence === 'HIGH' ? 1 : confidence === 'MEDIUM' ? 1 : 2;
-                    if (isWaitingRef.current && actionConfirmCountRef.current < requiredConfirms) {
-                      // 暂不切换，等更多确认
-                    } else {
-                      setIsWaiting(false);
-                      isWaitingRef.current = false;
-                      setIsThinking(false);
-                      setLastAdvice(earlyResult.display);
-                      setAdviceType(earlyResult.type);
-                      adviceTypeRef.current = earlyResult.type;
-                      setPinnedAdvice(earlyResult.display);
-                      pinnedAdviceRef.current = earlyResult.display;
-                    }
-                  }
-                }
-              }
-            }
-          },
-          onResponseDone: () => {
-            sendingRef.current = false;
-            setIsThinking(false);
-            // 手动触发的检测：响应完成后自动暂停
-            if (isManualTriggerRef.current) {
-              isManualTriggerRef.current = false;
-              isPausedRef.current = true;
-              setIsPaused(true);
-              console.log('⏸ 手动检测完成，自动暂停');
-            }
-            // 有等待中的帧 → 立即发送（暂停模式下跳过）
-            if (pendingFrameRef.current && !isPausedRef.current) {
-              pendingFrameRef.current = false;
-              sendFrameToAI();
-            }
-          },
-          onError: (msg, isNetworkError) => {
-            sendingRef.current = false;
-            setIsThinking(false);
-            setErrorMsg(msg);
-            if (isNetworkError) {
-              // 网络完全不通 — 设 ERROR，用户需手动重连
-              setConnectionState(ConnectionState.ERROR);
-            } else {
-              // API 错误 — 显示错误消息，3 秒后自动清除
-              setTimeout(() => setErrorMsg(""), 3000);
-            }
-          },
-        });
-      }
-
-      await serviceRef.current.connect();
+      await startCapture(captureMode);
+      await connect();
     } catch (err: any) {
       console.error(err);
-      let friendlyMsg = "启动捕获失败";
+      stopCapture(); // Clean up on failure (#6)
+      let friendlyMsg = '启动捕获失败';
       if (err.name === 'NotAllowedError') {
         if (captureMode === 'TAB') {
           friendlyMsg = isMacOS()
-            ? "屏幕录制权限未开启。请前往：系统设置 → 隐私与安全性 → 屏幕录制，勾选您的浏览器后重启浏览器。或切换为摄像头模式。"
-            : "权限被拒绝。请确认浏览器已获得屏幕捕获权限，或尝试摄像头模式。";
+            ? '屏幕录制权限未开启。请前往：系统设置 → 隐私与安全性 → 屏幕录制，勾选您的浏览器后重启浏览器。或切换为摄像头模式。'
+            : '权限被拒绝。请确认浏览器已获得屏幕捕获权限，或尝试摄像头模式。';
         } else {
-          friendlyMsg = "摄像头访问被拒绝，请在浏览器设置中允许摄像头权限。";
+          friendlyMsg = '摄像头访问被拒绝，请在浏览器设置中允许摄像头权限。';
         }
-      } else if (err.message?.includes("disallowed by permissions policy")) {
-        friendlyMsg = "浏览器策略阻止了屏幕捕获，请使用摄像头模式或在独立标签页中打开。";
+      } else if (err.message?.includes('disallowed by permissions policy')) {
+        friendlyMsg = '浏览器策略阻止了屏幕捕获，请使用摄像头模式或在独立标签页中打开。';
       }
-
       setErrorMsg(friendlyMsg);
-      setConnectionState(ConnectionState.ERROR);
-      stopCapture();
     }
   };
 
-  // HMR / unmount 清理：确保旧的 WebSocket 和采集循环被正确释放
+  // Manual detect
+  const handleManualDetect = useCallback(() => {
+    const frame = captureOnce();
+    if (!frame || !sendFrameRef.current) return;
+    sendFrameRef.current(frame, true);
+  }, [captureOnce]);
+
+  // HMR cleanup
   useEffect(() => {
     return () => {
       stopCapture();
-      serviceRef.current?.disconnect();
-      serviceRef.current = null;
+      disconnect();
     };
-  }, [stopCapture]);
+  }, [stopCapture, disconnect]);
 
   const getActionBadgeStyle = () => {
-    switch (adviceType) {
+    const display = uiState.display.toUpperCase();
+
+    // 根据 display 内容判断具体行动
+    if (display.includes('ALL-IN') || display.includes('全压')) {
+      return 'bg-purple-600 text-white'; // 全压 - 紫色
+    }
+    if (display.includes('RAISE') || display.includes('BET') || display.includes('加注')) {
+      return 'bg-blue-600 text-white'; // 加注 - 蓝色
+    }
+    if (display.includes('CALL') || display.includes('跟注')) {
+      return 'bg-emerald-600 text-white'; // 跟注 - 绿色
+    }
+    if (display.includes('CHECK') || display.includes('过牌')) {
+      return 'bg-teal-600 text-white'; // 过牌 - 青色
+    }
+    if (display.includes('FOLD') || display.includes('弃牌')) {
+      return 'bg-red-600 text-white'; // 弃牌 - 红色
+    }
+
+    // 根据 phase 回退
+    switch (uiState.phase) {
       case 'ACTION': return 'bg-blue-600 text-white';
       case 'FOLD': return 'bg-red-600 text-white';
       case 'GOOD': return 'bg-emerald-600 text-white';
@@ -616,29 +254,22 @@ const PokerHUD = () => {
 
   const getConnectionIndicator = () => {
     switch (connectionState) {
-      case ConnectionState.CONNECTED:
-        return 'bg-green-500 animate-pulse';
-      case ConnectionState.CONNECTING:
-        return 'bg-blue-500 animate-pulse';
-      case ConnectionState.ERROR:
-        return 'bg-red-500';
-      default:
-        return 'bg-zinc-700';
+      case ConnectionState.CONNECTED: return 'bg-green-500 animate-pulse';
+      case ConnectionState.CONNECTING: return 'bg-blue-500 animate-pulse';
+      case ConnectionState.ERROR: return 'bg-red-500';
+      default: return 'bg-zinc-700';
     }
   };
 
   const getButtonLabel = () => {
     switch (connectionState) {
-      case ConnectionState.CONNECTED:
-        return '停止';
-      case ConnectionState.CONNECTING:
-        return '连接中...';
-      default:
-        return '开始';
+      case ConnectionState.CONNECTED: return '停止';
+      case ConnectionState.CONNECTING: return '连接中...';
+      default: return '开始';
     }
   };
 
-  const isActive = connectionState === ConnectionState.CONNECTED;
+  const displayAnalysis = pinnedAnalysis;
 
   return (
     <div className="flex flex-col h-screen bg-black text-white font-sans overflow-hidden">
@@ -650,6 +281,18 @@ const PokerHUD = () => {
         </div>
 
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowPreview(v => !v)}
+            className={`px-3 py-1.5 rounded-full text-[10px] font-bold transition-all border ${
+              showPreview
+                ? 'bg-zinc-700 text-white border-zinc-600'
+                : 'bg-zinc-800 text-zinc-500 border-zinc-700'
+            }`}
+            title={showPreview ? '隐藏画面' : '显示画面'}
+          >
+            {showPreview ? '隐藏画面' : '显示画面'}
+          </button>
+
           <div className="flex bg-zinc-800 rounded-full p-1 border border-zinc-700">
             <button
               onClick={() => setCaptureMode('TAB')}
@@ -694,137 +337,134 @@ const PokerHUD = () => {
         <video ref={videoRef} className="hidden" playsInline muted />
         <canvas ref={canvasRef} className="hidden" />
 
-        {/* Left: Screen Preview (large) */}
-        <div className="flex-[3] bg-zinc-950 flex items-center justify-center relative border-r border-zinc-800">
-          {isActive && debugImage ? (
-            <>
-              <img src={debugImage} className="w-full h-full object-contain" />
-              <div className="absolute top-3 left-3 px-2.5 py-1 bg-red-600/90 text-[10px] font-bold rounded-lg flex items-center gap-1.5 shadow-lg">
-                <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
-                LIVE
+        {/* Left: Screen Preview */}
+        {showPreview && (
+          <div className="flex-[3] bg-zinc-950 flex items-center justify-center relative border-r border-zinc-800">
+            {isActive && debugImage ? (
+              <>
+                <img src={debugImage} className="w-full h-full object-contain" />
+                <div className="absolute top-3 left-3 px-2.5 py-1 bg-red-600/90 text-[10px] font-bold rounded-lg flex items-center gap-1.5 shadow-lg">
+                  <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
+                  LIVE
+                </div>
+              </>
+            ) : (
+              <div className="flex flex-col items-center justify-center pointer-events-none opacity-20">
+                <div className="text-zinc-800 text-[20vw] font-black italic select-none leading-none">GTO</div>
+                <p className="text-zinc-600 font-mono text-[10px] tracking-widest mt-4">
+                  {captureMode === 'TAB' ? '桌面屏幕同步' : '手机摄像头扫描'}
+                </p>
               </div>
-            </>
-          ) : (
-            <div className="flex flex-col items-center justify-center pointer-events-none opacity-20">
-              <div className="text-zinc-800 text-[20vw] font-black italic select-none leading-none">GTO</div>
-              <p className="text-zinc-600 font-mono text-[10px] tracking-widest mt-4">
-                {captureMode === 'TAB' ? '桌面屏幕同步' : '手机摄像头扫描'}
-              </p>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {/* Right: Strategy Panel */}
         <div className="flex-[2] bg-zinc-900 flex flex-col min-w-[340px] overflow-hidden">
 
-          {/* ① 状态指示条 — 极简 */}
+          {/* Status Indicator */}
           {connectionState === ConnectionState.DISCONNECTED ? (
             <div className="flex-shrink-0 flex items-center justify-center px-6 py-2 bg-zinc-800/30 border-b border-zinc-800/30">
               <span className="text-[10px] text-zinc-500 font-mono">点击「开始」启动 AI 分析</span>
             </div>
-          ) : isWaiting ? (
+          ) : uiState.phase === 'WAITING' ? (
             <div className="flex-shrink-0 flex items-center justify-center px-6 py-1.5 bg-zinc-950/80 border-b border-zinc-800/30">
               <span className="text-[10px] text-zinc-600 font-mono tracking-widest">WAITING</span>
             </div>
           ) : null}
 
-          {/* ② 详细分析区 — 可滚动 */}
+          {/* Analysis Area */}
           <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
 
-            {/* 流式文字（AI 正在打字时实时显示） */}
-            {isThinking && streamingText && (
-              <div className="bg-zinc-800/40 rounded-2xl px-4 py-3 border border-zinc-700/30">
-                <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-2 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse"></span>
-                  实时输出
+            {displayAnalysis && (
+              <div className={`flex flex-col gap-3 transition-opacity duration-300 ${uiState.phase === 'WAITING' ? 'opacity-50' : ''}`}>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    { label: '手牌', value: displayAnalysis.hand || '—' },
+                    { label: '位置', value: displayAnalysis.position || '—' },
+                    { label: '公共牌', value: displayAnalysis.board || '无' },
+                    { label: '阶段', value: displayAnalysis.stage || '—' },
+                    { label: '底池', value: displayAnalysis.pot || '—' },
+                    { label: '跟注额', value: displayAnalysis.callAmt && displayAnalysis.callAmt !== '0' ? displayAnalysis.callAmt : '—' },
+                    { label: '底池赔率', value: displayAnalysis.odds || '—' },
+                    { label: 'SPR', value: displayAnalysis.spr || '—' },
+                  ].map(({ label, value }) => (
+                    <div key={label} className="bg-zinc-800/70 rounded-xl px-3 py-2 border border-zinc-700/40">
+                      <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-0.5">{label}</div>
+                      <div className="text-sm text-zinc-200 font-semibold">{value}</div>
+                    </div>
+                  ))}
                 </div>
-                <p className="text-xs text-zinc-400 leading-relaxed font-mono whitespace-pre-wrap">{streamingText}</p>
+                {displayAnalysis.detail && (
+                  <div className="bg-zinc-800/50 rounded-2xl px-4 py-3 border border-zinc-700/40">
+                    <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-2">详细分析</div>
+                    <p className="text-sm text-zinc-300 leading-relaxed">{displayAnalysis.detail}</p>
+                  </div>
+                )}
+                {uiState.phase !== 'WAITING' && uiState.phase !== 'NEUTRAL' && uiState.display && uiState.display !== '就绪' && uiState.display !== '等待中...' && (
+                  <div className={`rounded-2xl px-4 py-4 flex items-center justify-center ${getActionBadgeStyle()}`}>
+                    <span className="text-2xl font-black tracking-wide uppercase">{uiState.display}</span>
+                  </div>
+                )}
               </div>
             )}
 
-            {(() => {
-              const displayAnalysis = pinnedAnalysis;
-
-              // 有分析数据 → 始终显示，WAITING 时降低视觉权重
-              if (displayAnalysis) {
-                return (
-                  <div className={`flex flex-col gap-3 transition-opacity duration-300 ${isWaiting ? 'opacity-50' : ''}`}>
-                    <div className="grid grid-cols-2 gap-2">
-                      {[
-                        { label: '手牌', value: displayAnalysis.hand || '—' },
-                        { label: '位置', value: displayAnalysis.position || '—' },
-                        { label: '公共牌', value: displayAnalysis.board || '无' },
-                        { label: '阶段', value: displayAnalysis.stage || '—' },
-                        { label: '底池', value: displayAnalysis.pot || '—' },
-                        { label: '跟注额', value: displayAnalysis.callAmt && displayAnalysis.callAmt !== '0' ? displayAnalysis.callAmt : '—' },
-                        { label: '底池赔率', value: displayAnalysis.odds || '—' },
-                        { label: 'SPR', value: displayAnalysis.spr || '—' },
-                      ].map(({ label, value }) => (
-                        <div key={label} className="bg-zinc-800/70 rounded-xl px-3 py-2 border border-zinc-700/40">
-                          <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-0.5">{label}</div>
-                          <div className="text-sm text-zinc-200 font-semibold">{value}</div>
-                        </div>
-                      ))}
-                    </div>
-                    {displayAnalysis.detail && (
-                      <div className="bg-zinc-800/50 rounded-2xl px-4 py-3 border border-zinc-700/40">
-                        <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-2">详细分析</div>
-                        <p className="text-sm text-zinc-300 leading-relaxed">{displayAnalysis.detail}</p>
-                      </div>
-                    )}
-                    {/* 行动总结 — 从分析得出 */}
-                    {!isWaiting && adviceType !== 'NEUTRAL' && lastAdvice && lastAdvice !== '就绪' && lastAdvice !== '等待中...' && (
-                      <div className={`rounded-2xl px-4 py-4 flex items-center justify-center ${getActionBadgeStyle()}`}>
-                        <span className="text-2xl font-black tracking-wide uppercase">{lastAdvice}</span>
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-
-              // 无数据时的占位
-              if (isThinking) return null;
-              if (!isActive) return null;
-              return (
-                <div className="flex-1 flex items-center justify-center text-zinc-700 text-xs font-mono italic">
-                  等待 AI 分析...
-                </div>
-              );
-            })()}
+            {!displayAnalysis && isThinking && null}
+            {!displayAnalysis && !isActive && null}
+            {!displayAnalysis && isActive && !isThinking && (
+              <div className="flex-1 flex items-center justify-center text-zinc-700 text-xs font-mono italic">
+                等待 AI 分析...
+              </div>
+            )}
           </div>
 
-          {/* ③ 手动检测按钮 */}
+          {/* Mode Toggle + Manual Detect */}
           {isActive && (
-            <div className="flex-shrink-0 px-4 py-3 border-t border-zinc-800/50">
-              <button
-                onClick={handleManualDetect}
-                disabled={sendingRef.current}
-                className={`w-full py-3 rounded-xl font-bold text-sm transition-all active:scale-[0.98] ${
-                  isPaused
-                    ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
-                    : isThinking
+            <div className="flex-shrink-0 px-4 py-3 border-t border-zinc-800/50 flex flex-col gap-2">
+              {/* Auto/Manual Toggle */}
+              <div className="flex bg-zinc-800 rounded-xl p-1 border border-zinc-700">
+                <button
+                  onClick={() => setMode('AUTO')}
+                  className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all ${
+                    mode === 'AUTO' ? 'bg-green-600 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                >
+                  自动检测
+                </button>
+                <button
+                  onClick={() => setMode('MANUAL')}
+                  className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all ${
+                    mode === 'MANUAL' ? 'bg-amber-600 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                >
+                  手动检测
+                </button>
+              </div>
+              {/* Manual Mode: Show Detect Button */}
+              {mode === 'MANUAL' && (
+                <button
+                  onClick={handleManualDetect}
+                  disabled={isThinking}
+                  className={`w-full py-3 rounded-xl font-bold text-sm transition-all active:scale-[0.98] ${
+                    isThinking
                       ? 'bg-zinc-700 text-zinc-400 cursor-wait'
-                      : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700'
-                }`}
-              >
-                {isThinking ? '分析中...' : isPaused ? '检测一次' : '检测一次'}
-              </button>
-              {isPaused && (
-                <div className="text-center mt-1.5 text-[10px] text-zinc-500 font-mono">
-                  已暂停自动检测 · 点击按钮手动触发
-                </div>
+                      : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+                  }`}
+                >
+                  {isThinking ? '分析中...' : '检测一次'}
+                </button>
               )}
             </div>
           )}
 
-          {/* ④ 底部信息栏 */}
+          {/* Footer */}
           <div className="flex-shrink-0 px-4 py-2 border-t border-zinc-800/50 text-[9px] font-mono text-zinc-600 flex justify-between">
             <div className="flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
               <span>Qwen-Realtime</span>
             </div>
             <div className="flex gap-3">
-              {isPaused && <span className="text-amber-500">PAUSED</span>}
+              {mode === 'MANUAL' && <span className="text-amber-500">MANUAL</span>}
               <span>{captureMode === 'TAB' ? '屏幕' : '摄像头'}</span>
               <span>{FRAME_RATE}FPS · {MAX_IMAGE_DIMENSION}px</span>
             </div>

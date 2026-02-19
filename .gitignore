@@ -26,5 +26,8 @@ dist-ssr
 # Build outputs
 .next/
 
+# Wrangler local secrets
+.dev.vars
+
 # Claude Code config
 .claude/
