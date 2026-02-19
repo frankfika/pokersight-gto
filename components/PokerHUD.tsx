@@ -1,9 +1,9 @@
 
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import { QwenRealtimeService } from '../services/qwenRealtime';
 import { ConnectionState } from '../types';
 import { parsePokerResponse, AnalysisData, AdviceType } from '../utils/parseResponse';
-import { detectActionButtons } from '../utils/buttonDetector';
+import { detectActionButtons, detectButtonTransition, ButtonDetectionResult } from '../utils/buttonDetector';
 
 const FRAME_RATE = 1.0;
 const JPEG_QUALITY = 0.85;
@@ -65,8 +65,12 @@ const PokerHUD = () => {
   const waitingConfirmCountRef = useRef<number>(0);
   // 防误判：连续 ACTION 计数，WAITING→ACTION 需要 2 次连续确认
   const actionConfirmCountRef = useRef<number>(0);
-  // 最新按钮检测结果（每帧更新），供 handleTranscription 参考
-  const hasButtonsRef = useRef<boolean>(false);
+  // 最新按钮检测结果（每帧更新），供 handleTranscription/onDelta 参考
+  const buttonResultRef = useRef<ButtonDetectionResult>({
+    hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW',
+  });
+  // 上一帧是否有按钮（用于状态变化检测）
+  const prevButtonStateRef = useRef<boolean>(false);
   // ACTION 状态最近一次设置时间（用于判断是否已稳定）
   const lastActionSetTimeRef = useRef<number>(0);
 
@@ -94,7 +98,8 @@ const PokerHUD = () => {
     unchangedCountRef.current = 0;
     waitingConfirmCountRef.current = 0;
     actionConfirmCountRef.current = 0;
-    hasButtonsRef.current = false;
+    buttonResultRef.current = { hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW' };
+    prevButtonStateRef.current = false;
     lastActionSetTimeRef.current = 0;
     setDebugImage(null);
     setIsThinking(false);
@@ -123,14 +128,16 @@ const PokerHUD = () => {
     }
 
     // 防闪烁：当前显示 ACTION，AI 说 WAITING
-    // 规则：若 ACTION 刚设置 (<3s)，需要 2 次连续确认（防止快速 ACTION↔WAITING 闪烁）
-    //       若 ACTION 已稳定 (>3s)，立即信任（回合已结束）
+    // 规则：像素无按钮 → 立即接受（两者一致）
+    //       像素还有按钮 + ACTION<3s → 需要 2 次确认
+    //       ACTION>3s → 立即接受
     const currentlyShowingAction = !isWaitingRef.current &&
       ['ACTION', 'FOLD', 'GOOD'].includes(adviceTypeRef.current);
     if (waiting && currentlyShowingAction) {
       const actionAge = Date.now() - lastActionSetTimeRef.current;
-      if (actionAge < 3000 && waitingConfirmCountRef.current < 2) {
-        console.log(`⏸ 防闪烁: WAITING #${waitingConfirmCountRef.current}/2, ACTION刚设置${actionAge}ms前`);
+      const buttonsStillVisible = buttonResultRef.current.hasRedButton;
+      if (buttonsStillVisible && actionAge < 3000 && waitingConfirmCountRef.current < 2) {
+        console.log(`⏸ 防闪烁: WAITING #${waitingConfirmCountRef.current}/2, 按钮仍可见, ACTION刚设置${actionAge}ms前`);
         if (result.type === 'READY') {
           setPinnedAdvice(result.display);
           pinnedAdviceRef.current = result.display;
@@ -138,16 +145,31 @@ const PokerHUD = () => {
         }
         return;
       }
-      // ACTION已稳定超过3s，或已有2次连续WAITING → 直接清除
-      console.log(`✅ WAITING确认（ACTION持续${actionAge}ms, count=${waitingConfirmCountRef.current}）`);
+      // 像素无按钮 / ACTION已稳定超过3s / 已有2次连续WAITING → 直接清除
+      console.log(`✅ WAITING确认（ACTION持续${actionAge}ms, buttons=${buttonsStillVisible}, count=${waitingConfirmCountRef.current}）`);
     }
 
-    // 防误判：当前 WAITING，AI 说 ACTION → 始终需要连续 2 次确认才切换
-    // （防止 AI 误判预操作按钮；按钮检测器仅用于主动预览，不跳过此确认）
-    const currentlyWaiting = isWaitingRef.current;
-    if (!waiting && currentlyWaiting && actionConfirmCountRef.current < 2) {
-      console.log(`⏸ 防误判: ACTION #${actionConfirmCountRef.current}/2, 暂不切换`);
+    // 像素纠错：AI 说 WAITING 但像素检测到红色按钮 → AI 视觉错误，拒绝并更新分析数据
+    if (waiting && buttonResultRef.current.hasRedButton) {
+      console.log(`⚠️ AI说WAITING但像素检测到红色按钮 (confidence=${buttonResultRef.current.confidence}, density=${buttonResultRef.current.redDensity.toFixed(4)})，拒绝WAITING`);
+      // 仍然更新分析数据（手牌/底池等信息可能有用）
+      if (result.analysis) {
+        setPinnedAnalysis(result.analysis);
+      }
       return;
+    }
+
+    // 防误判：当前 WAITING，AI 说 ACTION → 根据像素置信度决定确认次数
+    // HIGH(红+蓝) = 1次，MEDIUM(红) = 1次，LOW(无按钮) = 2次
+    const currentlyWaiting = isWaitingRef.current;
+    if (!waiting && currentlyWaiting) {
+      const confidence = buttonResultRef.current.confidence;
+      const requiredConfirms = confidence === 'HIGH' ? 1 : confidence === 'MEDIUM' ? 1 : 2;
+      if (actionConfirmCountRef.current < requiredConfirms) {
+        console.log(`⏸ 防误判: ACTION #${actionConfirmCountRef.current}/${requiredConfirms} (confidence=${confidence}), 暂不切换`);
+        return;
+      }
+      console.log(`✅ ACTION确认 (confidence=${confidence}, count=${actionConfirmCountRef.current})`);
     }
 
     // 去重：避免相同状态重复触发UI更新（但 analysis 始终更新）
@@ -232,10 +254,10 @@ const PokerHUD = () => {
   // 简单帧变化检测：比较 base64 字符串长度差异 + 采样比较
   const isFrameChanged = useCallback((newFrame: string, oldFrame: string | null): boolean => {
     if (!oldFrame) return true;
-    // 长度差异超过 5% 认为有变化
+    // 长度差异超过 12% 认为有变化（过滤掉动画/计时器等微小变化）
     const lenDiff = Math.abs(newFrame.length - oldFrame.length) / oldFrame.length;
-    if (lenDiff > 0.05) return true;
-    // 采样比较：每隔 800 字符取一个字符，超过 12% 不同则认为有变化
+    if (lenDiff > 0.12) return true;
+    // 采样比较：每隔 800 字符取一个字符，超过 25% 不同则认为有变化
     const step = 800;
     let diffCount = 0;
     let sampleCount = 0;
@@ -243,12 +265,18 @@ const PokerHUD = () => {
       sampleCount++;
       if (newFrame[i] !== oldFrame[i]) diffCount++;
     }
-    return sampleCount === 0 || (diffCount / sampleCount) > 0.12;
+    return sampleCount === 0 || (diffCount / sampleCount) > 0.25;
   }, []);
 
   // 纯发送：将 latestFrameRef 发给 AI（不截帧、不调度）
-  const sendFrameToAI = useCallback(() => {
+  // force=true 时跳过冷却（按钮变化等高优先级事件）
+  const sendFrameToAI = useCallback((force = false) => {
     if (sendingRef.current || !serviceRef.current || !latestFrameRef.current) return;
+    // 最小发送间隔 3 秒（force 时跳过）
+    if (!force && lastSendTimeRef.current > 0) {
+      const sinceLastSend = Date.now() - lastSendTimeRef.current;
+      if (sinceLastSend < 3000) return;
+    }
     sendingRef.current = true;
     lastSentFrameRef.current = latestFrameRef.current;
     lastSendTimeRef.current = Date.now();
@@ -278,11 +306,26 @@ const PokerHUD = () => {
       const changed = isFrameChanged(latestFrameRef.current, lastSentFrameRef.current);
 
       if (changed) {
-        // 3a. 画面有变化：做按钮检测
-        const hasButtons = detectActionButtons(canvasRef.current);
-        hasButtonsRef.current = hasButtons;
+        // 3a. 画面有变化：做按钮检测（增强版）
+        const btnResult = detectActionButtons(canvasRef.current);
+        buttonResultRef.current = btnResult;
 
-        if (hasButtons && isWaitingRef.current && pinnedAdviceRef.current) {
+        // 检测按钮状态变化（出现/消失）
+        const transition = detectButtonTransition(prevButtonStateRef.current, btnResult);
+        prevButtonStateRef.current = transition.current;
+
+        if (transition.appeared) {
+          console.log(`🟢 按钮出现 (confidence=${btnResult.confidence}, red=${btnResult.redDensity.toFixed(4)})`);
+          // 预设确认计数，加速 WAITING→ACTION 转换
+          actionConfirmCountRef.current = Math.max(actionConfirmCountRef.current, 1);
+        }
+        if (transition.disappeared) {
+          console.log(`🔴 按钮消失`);
+          // 预设确认计数，加速 ACTION→WAITING 转换
+          waitingConfirmCountRef.current = Math.max(waitingConfirmCountRef.current, 1);
+        }
+
+        if (transition.current && isWaitingRef.current && pinnedAdviceRef.current) {
           // 检测到按钮 + 正在等待 + 有缓存的预判建议 → 立即显示 READY
           console.log('🎯 按钮检测到 + 有缓存READY → 立即显示');
           setIsWaiting(false);
@@ -290,23 +333,25 @@ const PokerHUD = () => {
           setLastAdvice(pinnedAdviceRef.current);
           setAdviceType('READY');
           adviceTypeRef.current = 'READY';
-          // 同时重置去重状态，让AI确认后能更新
           lastStateRef.current = null;
         }
 
-        // 3b. 发帧给AI（如果AI空闲）
+        // 3b. 按钮状态变化时优先发帧（高优先级事件，跳过冷却）
+        const shouldPrioritySend = transition.appeared || transition.disappeared;
         if (!sendingRef.current) {
-          sendFrameToAI();
+          sendFrameToAI(shouldPrioritySend);
+        } else if (shouldPrioritySend) {
+          // 按钮变化是高优先级，标记 pending 确保响应完后立即发
+          pendingFrameRef.current = true;
         } else {
-          // AI忙 → 标记等待，响应完后立即发
           pendingFrameRef.current = true;
         }
       } else {
         // 4. 画面没变化
         const elapsed = Date.now() - lastSendTimeRef.current;
-        if (elapsed > 10000 && !sendingRef.current) {
-          // 超过 10s 未发帧 → 强制发一次（安全兜底）
-          console.log('⏰ 10s 兜底发送');
+        if (elapsed > 15000 && !sendingRef.current) {
+          // 超过 15s 未发帧 → 强制发一次（安全兜底）
+          console.log('⏰ 15s 兜底发送');
           sendFrameToAI();
         }
         // 否则跳过
@@ -333,7 +378,8 @@ const PokerHUD = () => {
       lastStateRef.current = null;
       waitingConfirmCountRef.current = 0;
       actionConfirmCountRef.current = 0;
-      hasButtonsRef.current = false;
+      buttonResultRef.current = { hasRedButton: false, hasBlueButton: false, redDensity: 0, confidence: 'LOW' };
+      prevButtonStateRef.current = false;
       lastActionSetTimeRef.current = 0;
       return;
     }
@@ -384,10 +430,8 @@ const PokerHUD = () => {
           onTranscription: handleTranscription,
           onDelta: (delta: string) => {
             streamingAccRef.current += delta;
-            // WAITING: 完全静默
-            if (isWaitingRef.current) return;
-            // READY: 抑制流式文字，但继续做早期行动检测
-            if (adviceTypeRef.current !== 'READY') {
+            // WAITING/READY: 抑制流式文字显示，但继续做早期行动检测
+            if (!isWaitingRef.current && adviceTypeRef.current !== 'READY') {
               setStreamingText((prev: string) => prev + delta);
             }
             // 流式早期行动检测：ACTION 行一出现就立即显示，不等完整响应
@@ -399,12 +443,14 @@ const PokerHUD = () => {
                 if (earlyResult.type !== 'SKIP') {
                   const w = earlyResult.type === 'NEUTRAL' || earlyResult.type === 'READY';
                   if (w) {
-                    // 防闪烁：ACTION→WAITING 需要连续确认
+                    // 防闪烁：ACTION→WAITING 需要连续确认（与 handleTranscription 一致）
                     waitingConfirmCountRef.current++;
                     const showingAction = !isWaitingRef.current &&
                       ['ACTION', 'FOLD', 'GOOD'].includes(adviceTypeRef.current);
-                    if (showingAction && waitingConfirmCountRef.current < 2) {
-                      // 暂不切换，等下一帧确认
+                    const buttonsStillVisible = buttonResultRef.current.hasRedButton;
+                    const actionAge = Date.now() - lastActionSetTimeRef.current;
+                    if (showingAction && buttonsStillVisible && actionAge < 3000 && waitingConfirmCountRef.current < 2) {
+                      // 暂不切换，按钮仍可见且ACTION刚设置
                     } else {
                       setIsWaiting(true);
                       isWaitingRef.current = true;
@@ -414,11 +460,13 @@ const PokerHUD = () => {
                       setIsThinking(false);
                     }
                   } else {
-                    // 轮到我 — 按钮检测器确认时立即显示，否则等 handleTranscription 确认
+                    // 轮到我 — 根据像素置信度决定确认次数
                     actionConfirmCountRef.current++;
                     waitingConfirmCountRef.current = 0;
-                    if (isWaitingRef.current && actionConfirmCountRef.current < 2) {
-                      // 暂不切换，等完整响应二次确认
+                    const confidence = buttonResultRef.current.confidence;
+                    const requiredConfirms = confidence === 'HIGH' ? 1 : confidence === 'MEDIUM' ? 1 : 2;
+                    if (isWaitingRef.current && actionConfirmCountRef.current < requiredConfirms) {
+                      // 暂不切换，等更多确认
                     } else {
                       setIsWaiting(false);
                       isWaitingRef.current = false;
@@ -481,14 +529,22 @@ const PokerHUD = () => {
     }
   };
 
-  const getAdviceColor = () => {
+  // HMR / unmount 清理：确保旧的 WebSocket 和采集循环被正确释放
+  useEffect(() => {
+    return () => {
+      stopCapture();
+      serviceRef.current?.disconnect();
+      serviceRef.current = null;
+    };
+  }, [stopCapture]);
+
+  const getActionBadgeStyle = () => {
     switch (adviceType) {
-      case 'ACTION': return 'bg-blue-600 text-white shadow-[0_0_60px_rgba(37,99,235,0.4)]';
+      case 'ACTION': return 'bg-blue-600 text-white';
       case 'FOLD': return 'bg-red-600 text-white';
       case 'GOOD': return 'bg-emerald-600 text-white';
-      case 'READY': return 'bg-amber-500 text-black shadow-[0_0_40px_rgba(245,158,11,0.3)]';
-      case 'WARNING': return 'bg-amber-600 text-white';
-      default: return 'bg-zinc-800 text-zinc-400';
+      case 'READY': return 'bg-amber-500 text-black';
+      default: return 'bg-zinc-700 text-zinc-400';
     }
   };
 
@@ -595,47 +651,16 @@ const PokerHUD = () => {
         {/* Right: Strategy Panel */}
         <div className="flex-[2] bg-zinc-900 flex flex-col min-w-[340px] overflow-hidden">
 
-          {/* ① 主行动区 */}
-          {isThinking ? (
-            <div className="flex-shrink-0 flex flex-col items-center justify-center py-4 px-6 bg-zinc-800/40 transition-all duration-300">
-              <div className="text-[10px] text-zinc-500 font-mono flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-pulse"></span>
-                分析中
-              </div>
+          {/* ① 状态指示条 — 极简 */}
+          {connectionState === ConnectionState.DISCONNECTED ? (
+            <div className="flex-shrink-0 flex items-center justify-center px-6 py-2 bg-zinc-800/30 border-b border-zinc-800/30">
+              <span className="text-[10px] text-zinc-500 font-mono">点击「开始」启动 AI 分析</span>
             </div>
           ) : isWaiting ? (
-            /* 非我的回合 — 极简暗色条 */
-            <div className="flex-shrink-0 flex items-center justify-center px-6 py-2 bg-zinc-950/80 border-b border-zinc-800/30">
+            <div className="flex-shrink-0 flex items-center justify-center px-6 py-1.5 bg-zinc-950/80 border-b border-zinc-800/30">
               <span className="text-[10px] text-zinc-600 font-mono tracking-widest">WAITING</span>
             </div>
-          ) : adviceType === 'READY' ? (
-            /* 即将轮到我 — 黄色预备 */
-            <div className={`flex-shrink-0 flex flex-col items-center justify-center py-8 px-6 transition-all duration-300 ${getAdviceColor()} animate-pulse`}>
-              <div className="text-xs font-bold uppercase tracking-[0.3em] mb-3 flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-black/30 animate-ping"></span>
-                即将轮到你
-              </div>
-              <div className="text-4xl md:text-5xl font-black tracking-tight uppercase italic leading-none text-center">
-                {lastAdvice}
-              </div>
-            </div>
-          ) : connectionState === ConnectionState.DISCONNECTED ? (
-            /* 未连接 — 启动引导 */
-            <div className="flex-shrink-0 flex flex-col items-center justify-center py-8 px-6 bg-zinc-800/30">
-              <div className="text-zinc-600 text-sm font-medium">点击「开始」启动 AI 分析</div>
-            </div>
-          ) : (
-            /* 轮到我 — 超大醒目 + 闪烁边框 */
-            <div className={`flex-shrink-0 flex flex-col items-center justify-center py-10 px-6 transition-all duration-500 ${getAdviceColor()} ring-4 ring-white/30 ring-inset animate-[pulse_1.5s_ease-in-out_infinite]`}>
-              <div className="text-base font-black tracking-wide mb-3 flex items-center gap-2 uppercase">
-                <span className="text-lg">▶</span>
-                <span>轮到你！</span>
-              </div>
-              <div className="text-6xl md:text-7xl font-black tracking-tight uppercase italic leading-none text-center drop-shadow-[0_4px_24px_rgba(255,255,255,0.3)]">
-                {lastAdvice}
-              </div>
-            </div>
-          )}
+          ) : null}
 
           {/* ② 详细分析区 — 可滚动 */}
           <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
@@ -652,27 +677,22 @@ const PokerHUD = () => {
             )}
 
             {(() => {
-              if (isThinking) return null;
+              const displayAnalysis = pinnedAnalysis;
 
-              // ── 等待时：静默，不显示任何分析 ──
-              if (isWaiting) {
-                return null;
-              }
-
-              // ── 轮到我：完整显示 ──
-              if (analysis) {
+              // 有分析数据 → 始终显示，WAITING 时降低视觉权重
+              if (displayAnalysis) {
                 return (
-                  <>
+                  <div className={`flex flex-col gap-3 transition-opacity duration-300 ${isWaiting ? 'opacity-50' : ''}`}>
                     <div className="grid grid-cols-2 gap-2">
                       {[
-                        { label: '手牌', value: analysis.hand || '—' },
-                        { label: '位置', value: analysis.position || '—' },
-                        { label: '公共牌', value: analysis.board || '无' },
-                        { label: '阶段', value: analysis.stage || '—' },
-                        { label: '底池', value: analysis.pot || '—' },
-                        { label: '跟注额', value: analysis.callAmt && analysis.callAmt !== '0' ? analysis.callAmt : '—' },
-                        { label: '底池赔率', value: analysis.odds || '—' },
-                        { label: 'SPR', value: analysis.spr || '—' },
+                        { label: '手牌', value: displayAnalysis.hand || '—' },
+                        { label: '位置', value: displayAnalysis.position || '—' },
+                        { label: '公共牌', value: displayAnalysis.board || '无' },
+                        { label: '阶段', value: displayAnalysis.stage || '—' },
+                        { label: '底池', value: displayAnalysis.pot || '—' },
+                        { label: '跟注额', value: displayAnalysis.callAmt && displayAnalysis.callAmt !== '0' ? displayAnalysis.callAmt : '—' },
+                        { label: '底池赔率', value: displayAnalysis.odds || '—' },
+                        { label: 'SPR', value: displayAnalysis.spr || '—' },
                       ].map(({ label, value }) => (
                         <div key={label} className="bg-zinc-800/70 rounded-xl px-3 py-2 border border-zinc-700/40">
                           <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-0.5">{label}</div>
@@ -680,16 +700,24 @@ const PokerHUD = () => {
                         </div>
                       ))}
                     </div>
-                    {analysis.detail && (
+                    {displayAnalysis.detail && (
                       <div className="bg-zinc-800/50 rounded-2xl px-4 py-3 border border-zinc-700/40">
                         <div className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mb-2">详细分析</div>
-                        <p className="text-sm text-zinc-300 leading-relaxed">{analysis.detail}</p>
+                        <p className="text-sm text-zinc-300 leading-relaxed">{displayAnalysis.detail}</p>
                       </div>
                     )}
-                  </>
+                    {/* 行动总结 — 从分析得出 */}
+                    {!isWaiting && adviceType !== 'NEUTRAL' && lastAdvice && lastAdvice !== '就绪' && lastAdvice !== '等待中...' && (
+                      <div className={`rounded-2xl px-4 py-4 flex items-center justify-center ${getActionBadgeStyle()}`}>
+                        <span className="text-2xl font-black tracking-wide uppercase">{lastAdvice}</span>
+                      </div>
+                    )}
+                  </div>
                 );
               }
 
+              // 无数据时的占位
+              if (isThinking) return null;
               if (!isActive) return null;
               return (
                 <div className="flex-1 flex items-center justify-center text-zinc-700 text-xs font-mono italic">

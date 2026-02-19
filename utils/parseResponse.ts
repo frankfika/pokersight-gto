@@ -51,7 +51,15 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
       if (amount) return { type: 'ACTION', display: `加注 ${amount}` };
     }
     const m = raw.match(/(?:RAISE|BET|加注)\s*(\d+)/i) || fullText.match(/(?:RAISE|BET|加注)\s*(\d+)/i);
-    return { type: 'ACTION', display: m ? `加注 ${m[1]}` : '加注 RAISE' };
+    if (m) return { type: 'ACTION', display: `加注 ${m[1]}` };
+    // 兜底：从底池字段估算加注额（底池 2/3）
+    const potMatch = fullText.match(/底池[:：]\s*(\d+)/);
+    if (potMatch) {
+      const potVal = parseInt(potMatch[1], 10);
+      const raiseVal = Math.round(potVal * 2 / 3);
+      return { type: 'ACTION', display: `加注 ${raiseVal}` };
+    }
+    return { type: 'ACTION', display: '加注 RAISE' };
   }
   if (up.includes("CALL") || raw.includes("跟注")) {
     return { type: 'GOOD', display: '跟注 CALL' };
@@ -87,6 +95,34 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
     return { type: 'SKIP', display: '' };
   }
   return { type: 'WARNING', display: raw.slice(0, 20) + (raw.length > 20 ? '...' : '') };
+}
+
+/**
+ * Consistency check: if ACTION contradicts the analysis detail, trust the analysis.
+ * e.g. ACTION=RAISE but analysis says "应弃牌" → override to FOLD
+ */
+function fixContradiction(result: { display: string; type: AdviceType }, detail: string, fullText: string, raiseAmt?: string): { display: string; type: AdviceType } {
+  if (!detail) return result;
+  const d = detail;
+
+  // ACTION is aggressive (RAISE/CALL/CHECK) but analysis recommends FOLD
+  if (result.type === 'ACTION' || result.type === 'GOOD') {
+    if (/应(该)?弃牌|选择弃牌|建议弃牌|必须弃牌|果断弃牌|直接弃牌/.test(d)) {
+      return { type: 'FOLD', display: '弃牌 FOLD' };
+    }
+  }
+
+  // ACTION is FOLD but analysis recommends aggressive play
+  if (result.type === 'FOLD') {
+    if (/应(该)?加注|建议加注|选择加注|价值(下注|加注)/.test(d)) {
+      return detectAction('RAISE', fullText, raiseAmt);
+    }
+    if (/应(该)?跟注|建议跟注|选择跟注/.test(d)) {
+      return { type: 'GOOD', display: '跟注 CALL' };
+    }
+  }
+
+  return result;
 }
 
 /** Full parser: structured fields + action detection with multi-layer fallback */
@@ -139,16 +175,21 @@ export function parsePokerResponse(text: string): ParsedResponse {
       return { ...result, analysis };
     }
     if (result.type !== 'WARNING') {
-      return { ...result, analysis };
+      const fixed = fixContradiction(result, finalDetail, text, raiseAmt);
+      if (fixed !== result) console.log('⚠️ 一致性校正:', result.display, '→', fixed.display);
+      return { ...fixed, analysis };
     }
   }
 
   const firstLine = text.split('\n')[0].trim();
   const firstLineResult = detectAction(firstLine, text, raiseAmt);
   if (firstLineResult.type !== 'WARNING') {
-    return { ...firstLineResult, analysis };
+    const fixed = fixContradiction(firstLineResult, finalDetail, text, raiseAmt);
+    return { ...fixed, analysis };
   }
 
   // Full-text fallback
-  return { ...detectAction(text, text, raiseAmt), analysis };
+  const fallbackResult = detectAction(text, text, raiseAmt);
+  const fixedFallback = fixContradiction(fallbackResult, finalDetail, text, raiseAmt);
+  return { ...fixedFallback, analysis };
 }

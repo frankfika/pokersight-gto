@@ -97,7 +97,13 @@ ACTION: SKIP
 - 转牌/河牌强牌：底池的2/3到满池
 - 始终用"底池X/Y=具体金额"格式，如"底池2/3=200"
 
-**赔率：** 跟注赢率 = 跟注额/(底池+跟注额)，赢率够→CALL，不够→FOLD`;
+**赔率：** 跟注赢率 = 跟注额/(底池+跟注额)，赢率够→CALL，不够→FOLD
+
+⚠️⚠️ **ACTION必须和分析一致！**
+- 如果你分析认为应该弃牌，ACTION就必须是FOLD，绝不能写RAISE！
+- 如果你分析认为应该加注，ACTION就必须是RAISE，不能写FOLD！
+- ACTION行决定了显示给用户的大字建议，必须和分析结论完全匹配！
+- RAISE/BET时，"加注额"字段是**必填的**，格式：加注额: 底池X/Y=具体金额`;
 
 function b64(buf: Uint8Array) {
   let binary = "";
@@ -105,12 +111,25 @@ function b64(buf: Uint8Array) {
   return btoa(binary);
 }
 
+/** 每次 response.create 附带的格式提醒（防止模型进入懒惰模式） */
+const RESPONSE_INSTRUCTIONS = `务必按完整格式输出所有字段（每个字段单独一行）：
+ACTION: (FOLD/CALL/RAISE/CHECK/WAITING/SKIP)
+手牌: (如 A♠ K♦)
+公共牌: (如 Q♥ J♣ 2♦ 或 无)
+底池: (数字)
+阶段: (翻牌前/翻牌/转牌/河牌)
+分析: (简短理由)
+如果是RAISE/BET还要输出 加注额: 底池X/Y=金额
+如果是WAITING还要输出 预判: (动作)`;
+
 export class QwenRealtimeService {
   private ws: WebSocket | null = null;
   private cfg: QwenRealtimeConfig;
   private connecting = false;
   private url: string;
   private responseBuffer = "";
+  // 追踪会话历史 item IDs，用于清理旧消息防止模型复读
+  private conversationItemIds: string[] = [];
 
   constructor(cfg: QwenRealtimeConfig) {
     this.cfg = cfg;
@@ -140,6 +159,10 @@ export class QwenRealtimeService {
               this.responseBuffer += ev.delta;
               this.cfg.onDelta(ev.delta);
             }
+          } else if (t === "conversation.item.created") {
+            // 追踪会话中的 item（用于后续清理）
+            const itemId = ev.item?.id;
+            if (itemId) this.conversationItemIds.push(itemId);
           } else if (t === "response.done") {
             // Response cycle complete — deliver full transcription
             if (this.responseBuffer.trim()) {
@@ -149,6 +172,8 @@ export class QwenRealtimeService {
               console.warn('[QwenRealtime] Empty response received');
             }
             this.responseBuffer = "";
+            // 清理旧会话历史：保留最近 4 个 item（2轮对话），删除更早的
+            this.pruneConversation();
             this.cfg.onResponseDone();
           } else if (t === "error") {
             const errMsg = ev.error?.message || ev.error?.code || JSON.stringify(ev.error);
@@ -222,7 +247,24 @@ export class QwenRealtimeService {
     this.send({ type: "input_image_buffer.append", image: clean });
     // Manual commit + trigger response (requires turn_detection: null)
     this.send({ type: "input_audio_buffer.commit" });
-    this.send({ type: "response.create" });
+    this.send({
+      type: "response.create",
+      response: {
+        instructions: RESPONSE_INSTRUCTIONS,
+        max_output_tokens: 300,
+      },
+    });
+  }
+
+  /** 清理旧会话历史，保留最近 4 个 item（约 2 轮），删除更早的 */
+  private pruneConversation() {
+    const KEEP = 4;
+    if (this.conversationItemIds.length <= KEEP) return;
+    const toDelete = this.conversationItemIds.splice(0, this.conversationItemIds.length - KEEP);
+    for (const id of toDelete) {
+      this.send({ type: "conversation.item.delete", item_id: id });
+    }
+    console.log(`[QwenRealtime] Pruned ${toDelete.length} old conversation items`);
   }
 
   public disconnect() {
@@ -231,6 +273,7 @@ export class QwenRealtimeService {
       this.ws = null;
     }
     this.responseBuffer = "";
+    this.conversationItemIds = [];
     this.cfg.onStateChange(ConnectionState.DISCONNECTED);
   }
 }
