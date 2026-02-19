@@ -37,6 +37,11 @@ const PokerHUD = () => {
   const [pinnedAdvice, setPinnedAdvice] = useState<string | null>(null);
   const [pinnedAnalysis, setPinnedAnalysis] = useState<AnalysisData | null>(null);
   const [isWaiting, setIsWaiting] = useState<boolean>(false);
+  // 手动模式：暂停自动检测，等待用户点击触发
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const isPausedRef = useRef<boolean>(false);
+  // 标记是否为手动触发的检测（手动触发后响应完成自动暂停）
+  const isManualTriggerRef = useRef<boolean>(false);
 
   // Ref 镜像 isWaiting，供 useCallback 闭包内访问最新值
   const isWaitingRef = useRef<boolean>(false);
@@ -272,6 +277,8 @@ const PokerHUD = () => {
   // force=true 时跳过冷却（按钮变化等高优先级事件）
   const sendFrameToAI = useCallback((force = false) => {
     if (sendingRef.current || !serviceRef.current || !latestFrameRef.current) return;
+    // 暂停模式下跳过自动发送（除非是手动触发 force=true）
+    if (isPausedRef.current && !force) return;
     // 最小发送间隔 3 秒（force 时跳过）
     if (!force && lastSendTimeRef.current > 0) {
       const sinceLastSend = Date.now() - lastSendTimeRef.current;
@@ -293,6 +300,50 @@ const PokerHUD = () => {
     }
     serviceRef.current.sendFrame(latestFrameRef.current);
   }, []);
+
+  // 手动触发检测：立即截帧并发送给 AI，收到结果后暂停
+  const manualTrigger = useCallback(() => {
+    if (!serviceRef.current || sendingRef.current) return;
+    // 立即截取最新帧
+    captureLatestFrame();
+    if (!latestFrameRef.current) return;
+    // 标记为手动触发
+    isManualTriggerRef.current = true;
+    // 强制发送（跳过冷却和暂停检查）
+    console.log('👆 手动触发检测');
+    sendingRef.current = true;
+    lastSentFrameRef.current = latestFrameRef.current;
+    lastSendTimeRef.current = Date.now();
+    pendingFrameRef.current = false;
+    unchangedCountRef.current = 0;
+    streamingAccRef.current = "";
+    earlyActionDetectedRef.current = false;
+    setIsThinking(true);
+    setStreamingText("");
+    serviceRef.current.sendFrame(latestFrameRef.current);
+  }, [captureLatestFrame]);
+
+  // 切换暂停状态
+  const togglePause = useCallback(() => {
+    const newPaused = !isPausedRef.current;
+    isPausedRef.current = newPaused;
+    setIsPaused(newPaused);
+    if (!newPaused) {
+      console.log('▶️ 继续自动检测');
+    } else {
+      console.log('⏸ 暂停自动检测');
+    }
+  }, []);
+
+  // 手动检测按钮：始终触发一次检测，响应后自动暂停
+  const handleManualDetect = useCallback(() => {
+    // 取消暂停状态（如果有）
+    if (isPausedRef.current) {
+      isPausedRef.current = false;
+      setIsPaused(false);
+    }
+    manualTrigger();
+  }, [manualTrigger]);
 
   // 事件驱动帧调度：每秒截帧 + 帧差检测 + 按钮检测 + 智能发送
   const startCaptureLoop = useCallback(() => {
@@ -494,12 +545,18 @@ const PokerHUD = () => {
           onResponseDone: () => {
             sendingRef.current = false;
             setIsThinking(false);
-            // 有等待中的帧 → 立即发送
-            if (pendingFrameRef.current) {
+            // 手动触发的检测：响应完成后自动暂停
+            if (isManualTriggerRef.current) {
+              isManualTriggerRef.current = false;
+              isPausedRef.current = true;
+              setIsPaused(true);
+              console.log('⏸ 手动检测完成，自动暂停');
+            }
+            // 有等待中的帧 → 立即发送（暂停模式下跳过）
+            if (pendingFrameRef.current && !isPausedRef.current) {
               pendingFrameRef.current = false;
               sendFrameToAI();
             }
-            // 否则什么都不做 — 等 captureAndDispatch 检测到下一次变化
           },
           onError: (msg, isNetworkError) => {
             sendingRef.current = false;
@@ -736,13 +793,38 @@ const PokerHUD = () => {
             })()}
           </div>
 
-          {/* ③ 底部信息栏 */}
+          {/* ③ 手动检测按钮 */}
+          {isActive && (
+            <div className="flex-shrink-0 px-4 py-3 border-t border-zinc-800/50">
+              <button
+                onClick={handleManualDetect}
+                disabled={sendingRef.current}
+                className={`w-full py-3 rounded-xl font-bold text-sm transition-all active:scale-[0.98] ${
+                  isPaused
+                    ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+                    : isThinking
+                      ? 'bg-zinc-700 text-zinc-400 cursor-wait'
+                      : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700'
+                }`}
+              >
+                {isThinking ? '分析中...' : isPaused ? '检测一次' : '检测一次'}
+              </button>
+              {isPaused && (
+                <div className="text-center mt-1.5 text-[10px] text-zinc-500 font-mono">
+                  已暂停自动检测 · 点击按钮手动触发
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ④ 底部信息栏 */}
           <div className="flex-shrink-0 px-4 py-2 border-t border-zinc-800/50 text-[9px] font-mono text-zinc-600 flex justify-between">
             <div className="flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
               <span>Qwen-Realtime</span>
             </div>
             <div className="flex gap-3">
+              {isPaused && <span className="text-amber-500">PAUSED</span>}
               <span>{captureMode === 'TAB' ? '屏幕' : '摄像头'}</span>
               <span>{FRAME_RATE}FPS · {MAX_IMAGE_DIMENSION}px</span>
             </div>
