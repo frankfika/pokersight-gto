@@ -160,10 +160,18 @@ wss.on('connection', (client) => {
 
   const pendingMessages = [];
   let upstreamReady = false;
+  let pingInterval = null;
 
   upstream.on('open', () => {
     console.log('[Proxy] Upstream connected');
     upstreamReady = true;
+
+    // 心跳保活：每 20 秒发一次 ping，防止空闲超时断开
+    pingInterval = setInterval(() => {
+      if (upstream.readyState === WebSocket.OPEN) {
+        upstream.ping();
+      }
+    }, 20000);
 
     if (pendingMessages.length > 0) {
       console.log(`[Proxy] Flushing ${pendingMessages.length} buffered message(s)`);
@@ -198,6 +206,7 @@ wss.on('connection', (client) => {
   upstream.on('close', (code, reason) => {
     console.log('[Proxy] Upstream closed:', code, reason.toString());
     upstreamReady = false;
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (client.readyState === WebSocket.OPEN) {
       client.close(code, reason.toString());
     }
@@ -206,6 +215,7 @@ wss.on('connection', (client) => {
   upstream.on('error', (err) => {
     console.error('[Proxy] Upstream error:', err?.message || err);
     upstreamReady = false;
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     try {
       client.send(JSON.stringify({ type: 'proxy.error', error: err?.message || 'upstream error' }));
     } catch {}
@@ -235,6 +245,7 @@ wss.on('connection', (client) => {
   });
 
   client.on('close', () => {
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     try { upstream.close(); } catch {}
   });
 });

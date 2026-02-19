@@ -130,6 +130,11 @@ export class QwenRealtimeService {
   private responseBuffer = "";
   // 追踪会话历史 item IDs，用于清理旧消息防止模型复读
   private conversationItemIds: string[] = [];
+  // 自动重连
+  private shouldReconnect = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  private static MAX_RECONNECT_ATTEMPTS = 5;
 
   constructor(cfg: QwenRealtimeConfig) {
     this.cfg = cfg;
@@ -141,6 +146,7 @@ export class QwenRealtimeService {
   public async connect() {
     if (this.connecting || this.ws) return;
     this.connecting = true;
+    this.shouldReconnect = true;
     this.cfg.onStateChange(ConnectionState.CONNECTING);
     try {
       console.log('[QwenRealtime] Connecting to', this.url);
@@ -193,6 +199,7 @@ export class QwenRealtimeService {
             });
           } else if (t === "session.updated") {
             console.log('[QwenRealtime] Session updated successfully');
+            this.reconnectAttempts = 0; // 连接成功，重置重连计数
             this.cfg.onStateChange(ConnectionState.CONNECTED);
           }
         } catch (parseErr) {
@@ -212,12 +219,27 @@ export class QwenRealtimeService {
         const normalCodes = [1000, 1001, 1005];
         const desc = closeMessages[ev.code] || `未知错误 (${ev.code})`;
         console.log(`[QwenRealtime] WebSocket closed: ${ev.code} - ${desc}`, ev.reason || '');
-        if (!normalCodes.includes(ev.code)) {
+        this.ws = null;
+        this.responseBuffer = "";
+
+        // 异常关闭 → 自动重连
+        if (!normalCodes.includes(ev.code) && this.shouldReconnect) {
+          if (this.reconnectAttempts < QwenRealtimeService.MAX_RECONNECT_ATTEMPTS) {
+            const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
+            this.reconnectAttempts++;
+            console.log(`[QwenRealtime] 自动重连 ${this.reconnectAttempts}/${QwenRealtimeService.MAX_RECONNECT_ATTEMPTS}，${delay}ms 后重试...`);
+            this.cfg.onStateChange(ConnectionState.CONNECTING);
+            this.reconnectTimer = setTimeout(() => {
+              this.connecting = false;
+              this.connect();
+            }, delay);
+            return;
+          }
+          this.cfg.onError(`连接关闭: ${desc}（重连${QwenRealtimeService.MAX_RECONNECT_ATTEMPTS}次失败）`, true);
+        } else if (!normalCodes.includes(ev.code)) {
           this.cfg.onError(`连接关闭: ${desc}`, true);
         }
         this.cfg.onStateChange(ConnectionState.DISCONNECTED);
-        this.ws = null;
-        this.responseBuffer = "";
       };
       this.ws.onerror = (e: any) => {
         console.error('[QwenRealtime] WebSocket error:', e?.message || e);
@@ -268,6 +290,12 @@ export class QwenRealtimeService {
   }
 
   public disconnect() {
+    this.shouldReconnect = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
     if (this.ws) {
       try { this.ws.close(); } catch {}
       this.ws = null;
