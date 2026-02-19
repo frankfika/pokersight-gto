@@ -99,6 +99,19 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
 }
 
 /**
+ * Check if the text clearly recommends FOLD as the final action
+ */
+function isFoldRecommended(text: string): boolean {
+  // 结尾明确说弃牌
+  if (/最终(选择)?弃牌|结论[：:]?\s*弃牌|综上.*弃牌/.test(text)) return true;
+  // 各种建议弃牌的表述
+  if (/应(该)?弃牌|选择弃牌|建议弃牌|必须弃牌|果断弃牌|直接弃牌|只能弃牌|只能选择弃牌/.test(text)) return true;
+  // 简短的"弃牌"结论（通常是最后几个字）
+  if (/[\。，]\s*弃牌\s*[。\n]?$/m.test(text)) return true;
+  return false;
+}
+
+/**
  * Consistency check: if ACTION contradicts the analysis detail, trust the analysis.
  * e.g. ACTION=RAISE but analysis says "应弃牌" → override to FOLD
  * NOTE: FOLD is stable - once FOLD, always FOLD (won't be corrected to RAISE/CALL)
@@ -114,7 +127,7 @@ function fixContradiction(result: { display: string; type: AdviceType }, detail:
 
   // ACTION is aggressive (RAISE/CALL/CHECK) but analysis recommends FOLD
   if (result.type === 'ACTION' || result.type === 'GOOD') {
-    if (/应(该)?弃牌|选择弃牌|建议弃牌|必须弃牌|果断弃牌|直接弃牌/.test(d)) {
+    if (isFoldRecommended(d) || isFoldRecommended(fullText)) {
       return { type: 'FOLD', display: '弃牌 FOLD' };
     }
   }
