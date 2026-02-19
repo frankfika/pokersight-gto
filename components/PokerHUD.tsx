@@ -320,9 +320,18 @@ const PokerHUD = () => {
           actionConfirmCountRef.current = Math.max(actionConfirmCountRef.current, 1);
         }
         if (transition.disappeared) {
-          console.log(`🔴 按钮消失`);
-          // 预设确认计数，加速 ACTION→WAITING 转换
-          waitingConfirmCountRef.current = Math.max(waitingConfirmCountRef.current, 1);
+          console.log(`🔴 按钮消失 → 用户已行动，立即清除建议`);
+          // 用户已行动（弃牌/跟注/加注），立即清除建议，进入 WAITING
+          setIsWaiting(true);
+          isWaitingRef.current = true;
+          setLastAdvice('等待中...');
+          setAdviceType('NEUTRAL');
+          adviceTypeRef.current = 'NEUTRAL';
+          setIsThinking(false);
+          // 重置确认计数
+          waitingConfirmCountRef.current = 0;
+          actionConfirmCountRef.current = 0;
+          lastStateRef.current = null;
         }
 
         if (transition.current && isWaitingRef.current && pinnedAdviceRef.current) {

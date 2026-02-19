@@ -68,6 +68,7 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
     return { type: 'GOOD', display: '过牌 CHECK' };
   }
   if (up.includes("FOLD") || raw.includes("弃牌")) {
+    // FOLD 建议：最高优先级，不再会被后续响应改变
     return { type: 'FOLD', display: '弃牌 FOLD' };
   }
   if (up.includes("READY") || raw.includes("准备") || raw.includes("即将")) {
@@ -100,25 +101,21 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
 /**
  * Consistency check: if ACTION contradicts the analysis detail, trust the analysis.
  * e.g. ACTION=RAISE but analysis says "应弃牌" → override to FOLD
+ * NOTE: FOLD is stable - once FOLD, always FOLD (won't be corrected to RAISE/CALL)
  */
 function fixContradiction(result: { display: string; type: AdviceType }, detail: string, fullText: string, raiseAmt?: string): { display: string; type: AdviceType } {
   if (!detail) return result;
   const d = detail;
 
+  // FOLD 建议：保持稳定，不被修正
+  if (result.type === 'FOLD') {
+    return result;
+  }
+
   // ACTION is aggressive (RAISE/CALL/CHECK) but analysis recommends FOLD
   if (result.type === 'ACTION' || result.type === 'GOOD') {
     if (/应(该)?弃牌|选择弃牌|建议弃牌|必须弃牌|果断弃牌|直接弃牌/.test(d)) {
       return { type: 'FOLD', display: '弃牌 FOLD' };
-    }
-  }
-
-  // ACTION is FOLD but analysis recommends aggressive play
-  if (result.type === 'FOLD') {
-    if (/应(该)?加注|建议加注|选择加注|价值(下注|加注)/.test(d)) {
-      return detectAction('RAISE', fullText, raiseAmt);
-    }
-    if (/应(该)?跟注|建议跟注|选择跟注/.test(d)) {
-      return { type: 'GOOD', display: '跟注 CALL' };
     }
   }
 
