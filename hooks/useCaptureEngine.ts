@@ -106,6 +106,25 @@ export function useCaptureEngine(opts: UseCaptureEngineOptions) {
       } catch (e) {
         console.warn('video.play() interrupted:', e);
       }
+      // Wait for video to be fully ready (readyState === 4)
+      await new Promise<void>((resolve) => {
+        const video = videoRef.current!;
+        if (video.readyState >= 4) {
+          resolve();
+          return;
+        }
+        const onReady = () => {
+          video.removeEventListener('canplaythrough', onReady);
+          resolve();
+        };
+        video.addEventListener('canplaythrough', onReady);
+        // Safety timeout: don't block forever
+        setTimeout(() => {
+          video.removeEventListener('canplaythrough', onReady);
+          resolve();
+        }, 3000);
+      });
+      console.log('[CaptureEngine] Video ready, readyState:', videoRef.current.readyState);
     }
 
     stream.getVideoTracks()[0].onended = () => {

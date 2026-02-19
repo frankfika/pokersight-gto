@@ -26,6 +26,7 @@ const PokerHUD = () => {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [isActive, setIsActive] = useState(false);
   const [showPreview, setShowPreview] = useState(true);
+  const [isStarting, setIsStarting] = useState(false);
 
   // Ref to track uiState synchronously for shouldSuppressStreaming
   const uiStateRef = useRef<{ phase: string }>({ phase: 'WAITING' });
@@ -183,11 +184,16 @@ const PokerHUD = () => {
       return;
     }
 
+    if (isStarting) return; // Prevent double-click during startup
+    setIsStarting(true);
     setErrorMsg('');
 
     try {
+      // Step 1: Start capture and wait for video ready
       await startCapture(captureMode);
+      // Step 2: Connect WebSocket and wait for session ready
       await connect();
+      // startLoop is triggered by onConnected callback after session.updated
     } catch (err: any) {
       console.error(err);
       stopCapture(); // Clean up on failure (#6)
@@ -204,6 +210,8 @@ const PokerHUD = () => {
         friendlyMsg = '浏览器策略阻止了屏幕捕获，请使用摄像头模式或在独立标签页中打开。';
       }
       setErrorMsg(friendlyMsg);
+    } finally {
+      setIsStarting(false);
     }
   };
 
@@ -262,6 +270,7 @@ const PokerHUD = () => {
   };
 
   const getButtonLabel = () => {
+    if (isStarting) return '启动中...';
     switch (connectionState) {
       case ConnectionState.CONNECTED: return '停止';
       case ConnectionState.CONNECTING: return '连接中...';
@@ -315,11 +324,11 @@ const PokerHUD = () => {
             className={`px-6 py-2 rounded-full font-bold text-sm transition-all active:scale-95 ${
               isActive
                 ? 'bg-red-500/10 hover:bg-red-500/20 text-red-500 border border-red-500/30'
-                : connectionState === ConnectionState.CONNECTING
+                : (connectionState === ConnectionState.CONNECTING || isStarting)
                   ? 'bg-zinc-700 text-zinc-400 cursor-wait'
                   : 'bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-500/30'
             }`}
-            disabled={connectionState === ConnectionState.CONNECTING}
+            disabled={connectionState === ConnectionState.CONNECTING || isStarting}
           >
             {getButtonLabel()}
           </button>
