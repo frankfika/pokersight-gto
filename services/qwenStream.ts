@@ -1,5 +1,5 @@
 import { ConnectionState } from "../types";
-declare const process: any;
+import { getAnalyzeHttpUrl } from "./proxyUrl";
 
 interface QwenStreamConfig {
   onStateChange: (state: ConnectionState) => void;
@@ -73,8 +73,7 @@ export class QwenStreamService {
 
   constructor(cfg: QwenStreamConfig) {
     this.cfg = cfg;
-    const port = (process.env as any).WS_PROXY_PORT || '3301';
-    this.proxyUrl = `http://localhost:${port}/api/analyze`;
+    this.proxyUrl = getAnalyzeHttpUrl();
   }
 
   public async connect() {

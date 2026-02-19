@@ -1,5 +1,5 @@
 import { ConnectionState } from "../types";
-declare const process: any;
+import { getRealtimeWsUrl } from "./proxyUrl";
 
 interface QwenRealtimeConfig {
   onStateChange: (state: ConnectionState) => void;
@@ -138,8 +138,7 @@ export class QwenRealtimeService {
 
   constructor(cfg: QwenRealtimeConfig) {
     this.cfg = cfg;
-    const port = (process.env as any).WS_PROXY_PORT || '3301';
-    this.url = `ws://localhost:${port}/realtime`;
+    this.url = getRealtimeWsUrl();
     console.log('[QwenRealtime] URL:', this.url);
   }
 

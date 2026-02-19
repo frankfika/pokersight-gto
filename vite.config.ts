@@ -16,7 +16,8 @@ export default defineConfig(({ mode }) => {
     },
     plugins: [react()],
     define: {
-      'process.env.WS_PROXY_PORT': JSON.stringify(env.WS_PROXY_PORT || '3301')
+      'process.env.WS_PROXY_PORT': JSON.stringify(env.WS_PROXY_PORT || '3301'),
+      'process.env.VITE_WS_PROXY_URL': JSON.stringify(env.VITE_WS_PROXY_URL || ''),
     },
   };
 });
