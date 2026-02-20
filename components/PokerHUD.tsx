@@ -40,6 +40,7 @@ const PokerHUD = () => {
     handleButtonAppeared,
     handleButtonsDetectedWhileWaiting,
     reset: resetFSM,
+    setManualMode,
   } = useAnalysisFSM();
 
   // Keep uiStateRef in sync
@@ -219,8 +220,10 @@ const PokerHUD = () => {
   const handleManualDetect = useCallback(() => {
     const frame = captureOnce();
     if (!frame || !sendFrameRef.current) return;
+    // Set manual mode for immediate display (skip anti-misjudgment delays)
+    setManualMode();
     sendFrameRef.current(frame, true);
-  }, [captureOnce]);
+  }, [captureOnce, setManualMode]);
 
   // HMR cleanup
   useEffect(() => {
@@ -410,7 +413,7 @@ const PokerHUD = () => {
                     <p className="text-sm text-zinc-300 leading-relaxed">{displayAnalysis.detail}</p>
                   </div>
                 )}
-                {uiState.phase !== 'WAITING' && uiState.phase !== 'NEUTRAL' && uiState.display && uiState.display !== '就绪' && uiState.display !== '等待中...' && (
+                {uiState.phase !== 'WAITING' && uiState.phase !== 'NEUTRAL' && uiState.display && uiState.display !== '就绪' && uiState.display !== '非本人轮次' && (
                   <div className={`rounded-2xl px-4 py-4 flex items-center justify-center ${getActionBadgeStyle()}`}>
                     <span className="text-2xl font-black tracking-wide uppercase">{uiState.display}</span>
                   </div>

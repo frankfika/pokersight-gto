@@ -15,6 +15,8 @@ export interface AnalysisData {
   odds: string;
   spr: string;
   detail: string;
+  confidence: 'high' | 'medium' | 'low';
+  confidenceIssue?: string;
 }
 
 export interface ParsedResponse {
@@ -25,6 +27,134 @@ export interface ParsedResponse {
 
 /** Known field labels — used to stop extraction at the next field boundary */
 const FIELD_LABELS = ['ACTION', '预判', '预判加注额', '加注额', '手牌', '公共牌', '底池', '阶段', '分析', '位置', '跟注', '赔率', 'SPR'];
+
+/**
+ * Parse card rank from a card string (e.g. "A♠" -> "A", "10♦" -> "T")
+ */
+function parseCardRank(card: string): string {
+  const match = card.trim().match(/^([2-9]|10|T|[JQKA])/i);
+  if (!match) return '';
+  const rank = match[1].toUpperCase();
+  return rank === '10' ? 'T' : rank;
+}
+
+/**
+ * Extract all card ranks from a hand or board string
+ * e.g. "A♥ 8♥" -> ['A', '8'], "5♠ 6♦ Q♣" -> ['5', '6', 'Q']
+ */
+function extractRanks(cardsStr: string): string[] {
+  if (!cardsStr || cardsStr === '无' || cardsStr === '-') return [];
+  const cards = cardsStr.split(/\s+/);
+  return cards.map(parseCardRank).filter(r => r !== '');
+}
+
+/**
+ * Check if the analysis description is consistent with the actual hand and board
+ * Returns confidence level and optional issue description
+ */
+function validateAnalysisConsistency(hand: string, board: string, detail: string): { confidence: 'high' | 'medium' | 'low', issue?: string } {
+  if (!detail) return { confidence: 'medium' };
+
+  const handRanks = extractRanks(hand);
+  const boardRanks = extractRanks(board);
+  const allRanks = [...handRanks, ...boardRanks];
+  const detailLower = detail.toLowerCase();
+
+  // 检查"顶对X"类描述
+  const topPairMatch = detail.match(/顶对([AKQJT2-9])/i) || detail.match(/顶对\s*([AKQJT2-9])/i);
+  if (topPairMatch) {
+    const claimedRank = topPairMatch[1].toUpperCase();
+    // 顶对需要手牌中有这张牌，且公共牌也有这张牌
+    if (!handRanks.includes(claimedRank)) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"顶对${claimedRank}"，但手牌${hand}中没有${claimedRank}，可能是识别错误`
+      };
+    }
+    if (!boardRanks.includes(claimedRank)) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"顶对${claimedRank}"，但公共牌${board}中没有${claimedRank}`
+      };
+    }
+  }
+
+  // 检查"对X"类描述（非顶对）
+  const pairMatch = detail.match(/对([AKQJT2-9])/i);
+  if (pairMatch && !topPairMatch) {
+    const claimedRank = pairMatch[1].toUpperCase();
+    if (!handRanks.includes(claimedRank) && !boardRanks.includes(claimedRank)) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"对${claimedRank}"，但手牌和公共牌中都没有${claimedRank}`
+      };
+    }
+  }
+
+  // 检查"两对"描述
+  if (detail.includes('两对') || detail.includes('两對')) {
+    // 两对需要至少有两对相同的牌
+    const rankCounts = new Map<string, number>();
+    for (const rank of allRanks) {
+      rankCounts.set(rank, (rankCounts.get(rank) || 0) + 1);
+    }
+    const pairs = Array.from(rankCounts.entries()).filter(([_, count]) => count >= 2);
+    if (pairs.length < 2) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"两对"，但实际手牌${hand}和公共牌${board}无法组成两对`
+      };
+    }
+  }
+
+  // 检查"三条"描述
+  if (detail.includes('三条') || detail.includes('三條')) {
+    const rankCounts = new Map<string, number>();
+    for (const rank of allRanks) {
+      rankCounts.set(rank, (rankCounts.get(rank) || 0) + 1);
+    }
+    const hasThreeOfAKind = Array.from(rankCounts.values()).some(count => count >= 3);
+    if (!hasThreeOfAKind) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"三条"，但实际无法组成三条`
+      };
+    }
+  }
+
+  // 检查"顺子"描述
+  if (detail.includes('顺子') || detail.includes('順子')) {
+    // 简化检查：看是否有5张连续的牌
+    const uniqueRanks = [...new Set(allRanks)].sort();
+    if (uniqueRanks.length < 5) {
+      return {
+        confidence: 'low',
+        issue: `分析提到"顺子"，但牌张数不足`
+      };
+    }
+  }
+
+  // 检查手牌是否与公共牌重复（明显错误）
+  for (const rank of handRanks) {
+    if (boardRanks.includes(rank)) {
+      // 这种情况理论上不应该发生（一副牌只有4张同点数），除非AI看错了
+      return {
+        confidence: 'low',
+        issue: `手牌${hand}和公共牌${board}都有${rank}，识别可能有误（一副牌只有4张${rank}）`
+      };
+    }
+  }
+
+  // 检查手牌数量
+  if (handRanks.length !== 2 && handRanks.length !== 0) {
+    return {
+      confidence: 'low',
+      issue: `识别到手牌数量${handRanks.length}张，但应该恰好2张`
+    };
+  }
+
+  return { confidence: 'high' };
+}
 
 /** Extract a labeled field from structured AI output, e.g. "手牌: Ah Kd" */
 export function extractField(text: string, key: string): string {
@@ -90,7 +220,7 @@ export function detectAction(raw: string, fullText: string, raiseAmt?: string): 
     return { type: 'READY', display: hint };
   }
   if (up.includes("WAIT") || raw.includes("等待")) {
-    return { type: 'NEUTRAL', display: '等待中...' };
+    return { type: 'NEUTRAL', display: '非本人轮次' };
   }
   if (up.includes("SKIP")) {
     return { type: 'SKIP', display: '' };
@@ -205,7 +335,7 @@ function fixContradiction(result: { display: string; type: AdviceType }, detail:
 /** Full parser: structured fields + action detection with multi-layer fallback */
 export function parsePokerResponse(text: string): ParsedResponse {
   if (!text.trim()) {
-    return { display: '等待中...', type: 'NEUTRAL', analysis: null };
+    return { display: '非本人轮次', type: 'NEUTRAL', analysis: null };
   }
 
   // ── 1. Extract structured fields ──────────────────────────────
@@ -229,9 +359,12 @@ export function parsePokerResponse(text: string): ParsedResponse {
     finalDetail = text.trim();
   }
 
+  // ── 1c. Validate consistency between hand/board and analysis ─────────────────
+  const validation = validateAnalysisConsistency(hand, board, finalDetail);
+
   const hasStructuredData = !!(hand || board || stage || finalDetail);
   const analysis: AnalysisData | null = hasStructuredData
-    ? { hand, board, stage, position, pot, callAmt, odds, spr, detail: finalDetail }
+    ? { hand, board, stage, position, pot, callAmt, odds, spr, detail: finalDetail, confidence: validation.confidence, confidenceIssue: validation.issue }
     : null;
 
   // ── 2. Determine action ────────────────────────────────────────

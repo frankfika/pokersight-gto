@@ -235,7 +235,7 @@ describe('parsePokerResponse — WAITING', () => {
   it('detects WAITING', () => {
     const r = parsePokerResponse(WAITING_TEXT);
     expect(r.type).toBe('NEUTRAL');
-    expect(r.display).toContain('等待');
+    expect(r.display).toContain('非本人');
   });
 });
 
